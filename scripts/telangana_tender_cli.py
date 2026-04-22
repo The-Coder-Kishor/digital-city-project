@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+import requests
+
 from telangana_tenders import TelanganaTenderClient, recursive_unzip
 from telangana_tenders.client import validate_zip
 
@@ -100,24 +102,36 @@ def main() -> int:
             write_json(output_dir / "inspect" / "documents.json", docs_json)
 
     if not args.skip_award:
-        award = client.fetch_award_details(args.tender_id)
-        award_json = award.to_json()
-        print(f"\n[Award] URL: {award.url}")
-        print(f"[Award] Text preview: {award.text[:600]}")
-        if args.write_html:
-            write_text(output_dir / "inspect" / "award.html", award.html_text)
-        if args.write_json:
-            write_json(output_dir / "inspect" / "award.json", award_json)
+        try:
+            award = client.fetch_award_details(args.tender_id)
+            award_json = award.to_json()
+            print(f"\n[Award] URL: {award.url}")
+            print(f"[Award] Text preview: {award.text[:600]}")
+            if args.write_html:
+                write_text(output_dir / "inspect" / "award.html", award.html_text)
+            if args.write_json:
+                write_json(output_dir / "inspect" / "award.json", award_json)
+        except requests.RequestException as exc:
+            print(
+                "\n[Award] Skipped: this tender may not be awarded yet "
+                f"or award details are unavailable ({exc})."
+            )
 
     if not args.skip_award_docs:
-        award_docs = client.fetch_award_documents(args.tender_id)
-        award_docs_json = award_docs.to_json()
-        print(f"\n[AwardDocuments] URL: {award_docs.url}")
-        print(f"[AwardDocuments] Text preview: {award_docs.text[:600]}")
-        if args.write_html:
-            write_text(output_dir / "inspect" / "award_documents.html", award_docs.html_text)
-        if args.write_json:
-            write_json(output_dir / "inspect" / "award_documents.json", award_docs_json)
+        try:
+            award_docs = client.fetch_award_documents(args.tender_id)
+            award_docs_json = award_docs.to_json()
+            print(f"\n[AwardDocuments] URL: {award_docs.url}")
+            print(f"[AwardDocuments] Text preview: {award_docs.text[:600]}")
+            if args.write_html:
+                write_text(output_dir / "inspect" / "award_documents.html", award_docs.html_text)
+            if args.write_json:
+                write_json(output_dir / "inspect" / "award_documents.json", award_docs_json)
+        except requests.RequestException as exc:
+            print(
+                "\n[AwardDocuments] Skipped: this tender may not be awarded yet "
+                f"or award documents are unavailable ({exc})."
+            )
 
     if args.download:
         zip_path = output_dir / f"{args.tender_id}_documents.zip"
