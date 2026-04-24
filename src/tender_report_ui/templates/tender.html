@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>{{ tender.tender_id }} · Tender Report UI</title>
+  <style>
+    :root { --bg:#0b1220; --card:#0f1b33; --ink:#e5e7eb; --muted:#9ca3af; --accent:#22c55e; --warn:#f59e0b; --bad:#ef4444; --line:#24324f; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Arial; background: radial-gradient(1000px 500px at 20% 0%, #13244a, var(--bg)); color:var(--ink); }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 22px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+    .card { background: rgba(15, 27, 51, 0.9); border:1px solid var(--line); border-radius:14px; padding:14px; }
+    a { color: #93c5fd; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    input, select, textarea { background:#0b152b; color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:10px 12px; width:100%; }
+    textarea { min-height: 84px; }
+    button { background: #1f9d55; color:white; border:0; border-radius:10px; padding:10px 12px; cursor:pointer; }
+    button.secondary { background: #334155; }
+    .meta { color: var(--muted); font-size: 0.92rem; }
+    .pill { display:inline-block; padding:3px 10px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:0.82rem; }
+    .ok { color: var(--accent); }
+    .no { color: var(--bad); }
+    .step { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px dashed rgba(255,255,255,0.08); }
+    pre { white-space: pre-wrap; background:#071024; border:1px solid var(--line); padding:12px; border-radius:12px; max-height: 560px; overflow:auto; }
+    table { width:100%; border-collapse: collapse; }
+    td, th { border-bottom:1px solid var(--line); padding:10px 6px; text-align:left; vertical-align:top; }
+    th { color:#cbd5e1; font-weight:600; }
+    .two { display:grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .md { line-height: 1.55; }
+    .md h1,.md h2,.md h3 { margin: 16px 0 10px; }
+    .md h1 { font-size: 1.6rem; }
+    .md h2 { font-size: 1.25rem; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 6px; }
+    .md h3 { font-size: 1.05rem; color: #e2e8f0; }
+    .md p { margin: 10px 0; color: #e5e7eb; }
+    .md code { background: rgba(148,163,184,0.12); border:1px solid rgba(148,163,184,0.2); padding: 1px 6px; border-radius: 8px; }
+    .md pre code { background: transparent; border:0; padding: 0; }
+    .md a { color: #93c5fd; }
+    .md ul, .md ol { margin: 10px 0 10px 20px; }
+    .md table { margin: 12px 0; }
+    .md blockquote { border-left: 3px solid rgba(147,197,253,0.5); margin: 10px 0; padding: 6px 12px; color: #cbd5e1; background: rgba(2,6,23,0.35); border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        <div class="meta"><a href="/">← back</a></div>
+        <h1 style="margin:6px 0 4px;">{{ tender.tender_name }}</h1>
+        <div class="meta"><span class="pill">{{ tender.tender_id }}</span> <span class="pill">{{ tender.name_id }}</span></div>
+      </div>
+      <form method="post" action="/t/{{ tender.tender_id }}/run" class="row">
+        <select name="output" style="width:auto;">
+          <option value="markdown">markdown (fast)</option>
+          <option value="full">full (json+html+md)</option>
+        </select>
+        <button type="submit">Run pipeline</button>
+      </form>
+    </div>
+
+    <div class="grid" style="margin-top:14px;">
+      <section class="card">
+        <h2 style="margin:0 0 8px;">Workflow</h2>
+        <div class="step"><span>Portal / inspect collected</span><strong class="{{ 'ok' if workflow.has_inspect else 'no' }}">{{ 'OK' if workflow.has_inspect else 'missing' }}</strong></div>
+        <div class="step"><span>Documents extracted</span><strong class="{{ 'ok' if workflow.has_extracted else 'no' }}">{{ 'OK' if workflow.has_extracted else 'missing' }}</strong></div>
+        <div class="step"><span>Web crawl / deepresearch pages</span><strong class="{{ 'ok' if workflow.has_web else 'no' }}">{{ 'OK' if workflow.has_web else 'missing' }}</strong></div>
+        <div class="step"><span>Geotags</span><strong class="{{ 'ok' if workflow.has_geotags else 'no' }}">{{ 'OK' if workflow.has_geotags else 'missing' }}</strong></div>
+        <div class="step" style="border-bottom:0;"><span>Markdown report</span><strong class="{{ 'ok' if workflow.has_report else 'no' }}">{{ 'OK' if workflow.has_report else 'missing/empty' }}</strong></div>
+        <p class="meta" style="margin:10px 0 0;">Tip: run with <code>full</code> to populate JSON/HTML artifacts for richer source browsing.</p>
+      </section>
+
+      <section class="card">
+        <h2 style="margin:0 0 8px;">Vendor links</h2>
+        {% if current_vendor %}
+        <div class="meta" style="margin-bottom:10px;">Awarded/linked vendor: <strong>{{ current_vendor }}</strong></div>
+        <div style="margin-bottom:10px;"><a href="/vendor/{{ current_vendor | urlencode }}">Open vendor page</a></div>
+        {% else %}
+        <div class="meta" style="margin-bottom:10px;">No vendor was detected in this tender's documents.</div>
+        {% endif %}
+
+        <div class="meta" style="margin-bottom:6px;">Other tenders from same vendor</div>
+        <table>
+          <thead><tr><th>Tender</th><th>Title</th></tr></thead>
+          <tbody>
+            {% for rel in same_vendor_tenders %}
+            <tr>
+              <td><a href="/t/{{ rel.tender_id }}">{{ rel.tender_id }}</a></td>
+              <td>{{ rel.tender_title }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="2" class="meta">No other tenders found for this vendor.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+
+      <section class="card">
+        <h2 style="margin:0 0 8px;">Add sources</h2>
+        <div class="two">
+          <form method="post" action="/t/{{ tender.tender_id }}/sources/url">
+            <div class="meta" style="margin-bottom:6px;">URL source (news / twitter / etc)</div>
+            <select name="kind">
+              <option value="news">news</option>
+              <option value="twitter">twitter</option>
+              <option value="image_url">image_url</option>
+              <option value="web">web</option>
+              <option value="other_url">other_url</option>
+            </select>
+            <input name="title" placeholder="Title (optional)" />
+            <input name="url" placeholder="https://..." />
+            <textarea name="notes" placeholder="Notes (optional)"></textarea>
+            <button type="submit">Add URL</button>
+          </form>
+
+          <form method="post" enctype="multipart/form-data" action="/t/{{ tender.tender_id }}/sources/upload">
+            <div class="meta" style="margin-bottom:6px;">Upload (images / screenshots / PDFs)</div>
+            <select name="kind">
+              <option value="screenshot">screenshot</option>
+              <option value="image">image</option>
+              <option value="pdf">pdf</option>
+              <option value="other_file">other_file</option>
+            </select>
+            <input name="title" placeholder="Title (optional)" />
+            <input type="file" name="file" />
+            <textarea name="notes" placeholder="Notes (optional)"></textarea>
+            <button type="submit">Upload</button>
+          </form>
+        </div>
+      </section>
+    </div>
+
+    <section class="card" style="margin-top:14px;">
+      <h2 style="margin:0 0 8px;">Tender documents (doc1/doc2/doc3...)</h2>
+      <div class="meta">Documents from <code>outputs/tender_reports/{{ tender.tender_id }}</code></div>
+      <table style="margin-top:10px;">
+        <thead><tr><th>Doc</th><th>Type</th><th>Filename</th><th>Quick info</th></tr></thead>
+        <tbody>
+          {% for d in documents %}
+          <tr>
+            <td><span class="pill">doc{{ d.doc_no }}</span></td>
+            <td>{{ d.label }}</td>
+            <td class="meta">{{ d.file_name }}</td>
+            <td class="meta">
+              {% if d.tender_title %}{{ d.tender_title }}{% endif %}
+              {% if d.vendor_name %}{% if d.tender_title %} · {% endif %}Vendor: {{ d.vendor_name }}{% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" class="meta">No document JSON files found.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      {% for d in documents %}
+      <details style="margin-top:10px;" {% if d.doc_no in [1,2,3] %}open{% endif %}>
+        <summary class="meta">doc{{ d.doc_no }} - {{ d.label }} ({{ d.file_name }})</summary>
+        <pre>{{ d.payload | tojson(indent=2) }}</pre>
+      </details>
+      {% endfor %}
+    </section>
+
+    <section class="card" style="margin-top:14px;">
+      <h2 style="margin:0 0 8px;">User-added sources (SQLite)</h2>
+      <table>
+        <thead><tr><th>When</th><th>Kind</th><th>Title</th><th>URL / File</th><th>Notes</th></tr></thead>
+        <tbody>
+          {% for s in sources %}
+          <tr>
+            <td class="meta">{{ s.added_at }}</td>
+            <td><span class="pill">{{ s.kind }}</span></td>
+            <td>{{ s.title or '' }}</td>
+            <td class="meta">
+              {% if s.url %}<a href="{{ s.url }}" target="_blank" rel="noopener">{{ s.url }}</a>{% endif %}
+              {% if s.file_path %}<a href="/tfiles/{{ tender.tender_id }}/{{ s.file_path }}" target="_blank" rel="noopener">{{ s.file_path }}</a>{% endif %}
+            </td>
+            <td class="meta">{{ s.notes or '' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card" style="margin-top:14px;">
+      <h2 style="margin:0 0 8px;">Initial data (pipeline collection)</h2>
+      <div class="meta">Portal endpoints, download status, and local source directories used.</div>
+      <details style="margin-top:10px;" open>
+        <summary class="meta">Portal endpoints</summary>
+        <table>
+          <thead><tr><th>Endpoint</th><th>Status</th><th>URL</th><th>Preview / Error</th></tr></thead>
+          <tbody>
+          {% for k,v in endpoints.items() %}
+            <tr>
+              <td><span class="pill">{{ k }}</span></td>
+              <td class="meta">{{ v.get('status','') }}</td>
+              <td class="meta">{% if v.get('url') %}<a href="{{ v.get('url') }}" target="_blank" rel="noopener">{{ v.get('url') }}</a>{% endif %}</td>
+              <td class="meta">{{ v.get('text_preview','') or v.get('error','') }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </details>
+
+      <details style="margin-top:10px;">
+        <summary class="meta">Download status</summary>
+        <pre>{{ download_status | tojson(indent=2) }}</pre>
+      </details>
+
+      <details style="margin-top:10px;">
+        <summary class="meta">Source directories</summary>
+        <pre>{{ source_dirs | tojson(indent=2) }}</pre>
+      </details>
+    </section>
+
+    <section class="card" style="margin-top:14px;">
+      <h2 style="margin:0 0 8px;">Sources (internal files)</h2>
+      <div class="meta">Files used by document analysis (when JSON is present).</div>
+      <table>
+        <thead><tr><th>Path</th></tr></thead>
+        <tbody>
+          {% for p in sources_used %}
+          <tr><td class="meta">{{ p }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <details style="margin-top:10px;">
+        <summary class="meta">Extraction issues</summary>
+        <pre>{{ extraction_issues | tojson(indent=2) }}</pre>
+      </details>
+    </section>
+
+    <section class="card" style="margin-top:14px;">
+      <h2 style="margin:0 0 8px;">Sources (web)</h2>
+      <div class="meta">Deduped across baseline crawl + DeepResearch crawl.</div>
+      <details open>
+        <summary class="meta">Crawled pages</summary>
+        <table>
+          <thead><tr><th>Title</th><th>URL</th><th>Query</th><th>Error</th></tr></thead>
+          <tbody>
+            {% for p in all_web_pages %}
+            <tr>
+              <td>{{ p.get('title','') }}</td>
+              <td class="meta">{% if p.get('url') %}<a href="{{ p.get('url') }}" target="_blank" rel="noopener">{{ p.get('url') }}</a>{% endif %}</td>
+              <td class="meta">{{ p.get('query','') }}</td>
+              <td class="meta">{{ p.get('error','') }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </details>
+      <details style="margin-top:10px;">
+        <summary class="meta">Crawled page text (expand per page)</summary>
+        {% for p in all_web_pages %}
+          <details style="margin-top:8px;">
+            <summary class="meta">{{ p.get('title','(no title)') }} — {{ p.get('url','') }}</summary>
+            <pre>{{ (p.get('content','') or '') }}</pre>
+          </details>
+        {% endfor %}
+      </details>
+      <details style="margin-top:10px;">
+        <summary class="meta">Search results (raw)</summary>
+        <pre>{{ web_search_results | tojson(indent=2) }}</pre>
+      </details>
+    </section>
+
+    <section class="card" style="margin-top:14px;">
+      <h2 style="margin:0 0 8px;">Geotags</h2>
+      <div class="meta">Resolved via Nominatim in the pipeline; links prefer Google Maps + OSM hash view.</div>
+      <table>
+        <thead><tr><th>Query</th><th>Lat</th><th>Lon</th><th>Label</th><th>Maps</th><th>Error</th></tr></thead>
+        <tbody>
+          {% for g in geotags %}
+          <tr>
+            <td>{{ g.get('query','') }}</td>
+            <td class="meta">{{ g.get('lat','') }}</td>
+            <td class="meta">{{ g.get('lon','') }}</td>
+            <td class="meta">{{ g.get('display_name','') }}</td>
+            <td class="meta">
+              {% if g.get('google_maps') %}<a href="{{ g.get('google_maps') }}" target="_blank" rel="noopener">Google</a>{% endif %}
+              {% if g.get('openstreetmap') %} · <a href="{{ g.get('openstreetmap') }}" target="_blank" rel="noopener">OSM</a>{% endif %}
+            </td>
+            <td class="meta">{{ g.get('error','') }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card" style="margin-top:14px;">
+      <h2 style="margin:0 0 8px;">DeepResearch evidence</h2>
+      <details open>
+        <summary class="meta">Web quotes</summary>
+        <pre>{{ dr_web_quotes | tojson(indent=2) }}</pre>
+      </details>
+      <details style="margin-top:10px;">
+        <summary class="meta">File quotes</summary>
+        <pre>{{ dr_file_quotes | tojson(indent=2) }}</pre>
+      </details>
+      <details style="margin-top:10px;">
+        <summary class="meta">Entities</summary>
+        <pre>{{ dr_entities | tojson(indent=2) }}</pre>
+      </details>
+    </section>
+
+    <section class="card" style="margin-top:14px;">
+      <div class="row" style="justify-content:space-between;">
+        <h2 style="margin:0 0 8px;">Report (rendered)</h2>
+        <span class="pill">Markdown → HTML</span>
+      </div>
+      <div style="background:#071024;border:1px solid var(--line);border-radius:12px;padding:14px;">
+        <div style="max-width: 980px;">
+          <div class="md">{{ report_html | safe }}</div>
+        </div>
+      </div>
+      <details style="margin-top:10px;">
+        <summary class="meta">Show raw markdown</summary>
+        <pre>{{ report_md }}</pre>
+      </details>
+    </section>
+
+    <section class="card" style="margin-top:14px;">
+      <h2 style="margin:0 0 8px;">Key sources (from JSON, if present)</h2>
+      <div class="meta">If you ran <code>--output markdown</code> only, the JSON may not exist and this will be empty.</div>
+      <pre>{{ report_json | tojson(indent=2) }}</pre>
+    </section>
+  </main>
+</body>
+</html>
+

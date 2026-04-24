@@ -21,18 +21,8 @@ from telangana_tenders import TelanganaTenderClient, parse_html_to_json, recursi
 from telangana_tenders.client import validate_zip
 
 TEXT_EXTENSIONS = {
-    ".txt",
     ".md",
-    ".csv",
-    ".tsv",
     ".json",
-    ".xml",
-    ".html",
-    ".htm",
-    ".log",
-    ".yaml",
-    ".yml",
-    ".rtf",
 }
 
 SKIP_BINARY_EXTENSIONS = {
@@ -67,16 +57,19 @@ class SearchResult:
     source_query: str
 
 
-class OllamaChatClient:
+class OpenRouterChatClient:
     def __init__(
         self,
         model: str,
-        base_url: str = "http://localhost:11434",
+        base_url: str = "https://openrouter.ai/api/v1",
         timeout_seconds: float = 300.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.api_key = (os.getenv("OPENROUTER_API_KEY") or "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").strip()
+        if not self.api_key:
+            raise ValueError("OPENROUTER_API_KEY is required to call OpenRouter")
         self._session = requests.Session()
 
     def chat(
@@ -87,26 +80,33 @@ class OllamaChatClient:
         max_tokens: int = 2000,
         num_ctx: int | None = None,
     ) -> str:
+        _ = num_ctx
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
             "stream": False,
-            "options": {
-                "temperature": temperature,
-                "num_predict": max_tokens,
-                "num_ctx": int(num_ctx) if num_ctx is not None else 16384,
-            },
         }
         resp = self._session.post(
-            f"{self.base_url}/api/chat",
+            f"{self.base_url}/chat/completions",
             json=payload,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
             timeout=self.timeout_seconds,
         )
         resp.raise_for_status()
-        content = ((resp.json() or {}).get("message") or {}).get("content")
+        body = resp.json() or {}
+        choices = body.get("choices") or []
+        content: Any = None
+        if isinstance(choices, list) and choices:
+            content = ((choices[0] or {}).get("message") or {}).get("content")
+        if isinstance(content, list):
+            content = "".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
         if not isinstance(content, str) or not content.strip():
-            raise ValueError("Ollama returned empty content")
+            raise ValueError("OpenRouter returned empty content")
         return content
 
 
@@ -155,186 +155,13 @@ class DocumentReader:
     def _extract_text(self, path: Path) -> tuple[str, bool, str | None]:
         suffix = path.suffix.lower()
 
-        if suffix in SKIP_BINARY_EXTENSIONS:
-            return "", True, None
-
         if suffix in TEXT_EXTENSIONS:
             try:
-                raw = path.read_text(encoding="utf-8", errors="ignore")
-                if suffix == ".rtf":
-                    return self._extract_rtf_text(raw), True, None
-                return raw, True, None
+                return path.read_text(encoding="utf-8", errors="ignore"), True, None
             except OSError:
                 return "", True, f"Failed to read text file: {path.name}"
 
-        if suffix in {".docx", ".docm"}:
-            text = self._extract_docx_text(path)
-            return (text, True, None) if text else ("", True, f"Unable to extract {suffix} text")
-
-        if suffix == ".pdf":
-            text = self._extract_pdf_text(path)
-            return (text, True, None) if text else ("", True, "Unable to extract PDF text")
-
-        if suffix == ".doc":
-            text = self._extract_doc_text(path)
-            return (
-                (text, True, "Legacy DOC extracted heuristically; verify confidence")
-                if text
-                else ("", True, "Unable to extract DOC text")
-            )
-
-        if suffix in {".xlsx", ".xlsm"}:
-            text = self._extract_xlsx_text(path)
-            return (text, True, None) if text else ("", True, f"Unable to extract {suffix} text")
-
-        if suffix == ".xls":
-            text = self._extract_xls_text(path)
-            return (text, True, None) if text else ("", True, "Unable to extract XLS text")
-
-        if suffix == ".pptx":
-            text = self._extract_pptx_text(path)
-            return (text, True, None) if text else ("", True, "Unable to extract PPTX text")
-
-        if suffix == ".ppt":
-            text = self._extract_printable_runs(path)
-            return (
-                (text, True, "Legacy PPT extracted heuristically; verify confidence")
-                if text
-                else ("", True, "Unable to extract PPT text")
-            )
-
-        if suffix in {".odt", ".ods"}:
-            text = self._extract_open_document_text(path)
-            return (text, True, None) if text else ("", True, f"Unable to extract {suffix} text")
-
-        return "", False, f"Unhandled file extension: {suffix or '<none>'}"
-
-    def _extract_rtf_text(self, text: str) -> str:
-        text = re.sub(r"\\'[0-9a-fA-F]{2}", " ", text)
-        text = re.sub(r"\\[a-zA-Z]+-?\d*\s?", " ", text)
-        return text.replace("{", " ").replace("}", " ")
-
-    def _extract_docx_text(self, path: Path) -> str:
-        try:
-            import docx  # type: ignore
-
-            document = docx.Document(str(path))
-            paragraphs = [p.text for p in document.paragraphs if p.text]
-            if paragraphs:
-                return "\n".join(paragraphs)
-        except Exception:
-            pass
-
-        try:
-            with zipfile.ZipFile(path) as archive:
-                xml_data = archive.read("word/document.xml")
-            root = etree.fromstring(xml_data)
-            return " ".join(root.itertext())
-        except Exception:
-            return ""
-
-    def _extract_pdf_text(self, path: Path) -> str:
-        try:
-            from pypdf import PdfReader  # type: ignore
-
-            reader = PdfReader(str(path))
-            parts = []
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                if page_text.strip():
-                    parts.append(page_text)
-            if parts:
-                return "\n".join(parts)
-        except Exception:
-            pass
-
-        return self._extract_printable_runs(path)
-
-    def _extract_doc_text(self, path: Path) -> str:
-        antiword = shutil.which("antiword")
-        if antiword:
-            try:
-                completed = subprocess.run(
-                    [antiword, str(path)],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="ignore",
-                )
-                if completed.returncode == 0 and completed.stdout.strip():
-                    return completed.stdout
-            except OSError:
-                pass
-
-        return self._extract_printable_runs(path)
-
-    def _extract_xlsx_text(self, path: Path) -> str:
-        try:
-            from openpyxl import load_workbook  # type: ignore
-
-            workbook = load_workbook(filename=str(path), read_only=True, data_only=True)
-            parts: list[str] = []
-            for sheet in workbook.worksheets[:12]:
-                parts.append(f"[Sheet] {sheet.title}")
-                for row in sheet.iter_rows(min_row=1, max_row=300):
-                    values = [str(cell.value).strip() for cell in row if cell.value is not None]
-                    if values:
-                        parts.append(" | ".join(values))
-            return "\n".join(parts)
-        except Exception:
-            return ""
-
-    def _extract_xls_text(self, path: Path) -> str:
-        try:
-            import xlrd  # type: ignore
-
-            book = xlrd.open_workbook(str(path), on_demand=True)
-            parts: list[str] = []
-            for sheet in book.sheets()[:10]:
-                parts.append(f"[Sheet] {sheet.name}")
-                for row_idx in range(min(sheet.nrows, 300)):
-                    row_values = [str(v).strip() for v in sheet.row_values(row_idx) if str(v).strip()]
-                    if row_values:
-                        parts.append(" | ".join(row_values))
-            return "\n".join(parts)
-        except Exception:
-            return ""
-
-    def _extract_pptx_text(self, path: Path) -> str:
-        try:
-            from pptx import Presentation  # type: ignore
-
-            presentation = Presentation(str(path))
-            parts: list[str] = []
-            for slide_index, slide in enumerate(presentation.slides, start=1):
-                parts.append(f"[Slide {slide_index}]")
-                for shape in slide.shapes:
-                    if hasattr(shape, "text") and shape.text:
-                        value = str(shape.text).strip()
-                        if value:
-                            parts.append(value)
-            return "\n".join(parts)
-        except Exception:
-            return ""
-
-    def _extract_open_document_text(self, path: Path) -> str:
-        try:
-            with zipfile.ZipFile(path) as archive:
-                xml_data = archive.read("content.xml")
-            root = etree.fromstring(xml_data)
-            return " ".join(root.itertext())
-        except Exception:
-            return ""
-
-    def _extract_printable_runs(self, path: Path) -> str:
-        try:
-            data = path.read_bytes()
-        except OSError:
-            return ""
-        candidate = data.decode("latin-1", errors="ignore")
-        lines = re.findall(r"[A-Za-z0-9][^\r\n]{20,}", candidate)
-        return "\n".join(lines[:500])
+        return "", False, f"Skipped unsupported extension: {suffix or '<none>'}"
 
     def _normalize_text(self, text: str) -> str:
         if not text:
@@ -383,11 +210,30 @@ class LocalNewsCrawler:
 
         def _safe_text_search(ddgs_client: Any, query: str) -> list[dict[str, Any]]:
             try:
-                rows = ddgs_client.text(query, max_results=max_results_per_query) or []
-                return [row for row in rows if isinstance(row, dict)]
+                news_rows = []
+                try:
+                    news_rows = ddgs_client.news(query, max_results=max_results_per_query) or []
+                except Exception:
+                    pass
+                
+                text_rows = []
+                try:
+                    text_rows = ddgs_client.text(query, max_results=max_results_per_query, timelimit="m") or []
+                    if not text_rows:
+                        text_rows = ddgs_client.text(query, max_results=max_results_per_query) or []
+                except Exception:
+                    try:
+                        text_rows = ddgs_client.text(query, max_results=max_results_per_query) or []
+                    except Exception:
+                        pass
+                        
+                combined = []
+                for r in news_rows:
+                    if isinstance(r, dict): combined.append(r)
+                for r in text_rows:
+                    if isinstance(r, dict): combined.append(r)
+                return combined
             except Exception:
-                # ddgs raises exceptions (e.g. "No results found") for empty results.
-                # Treat those as a normal no-hit case and continue.
                 return []
 
         seen: set[str] = set()
@@ -396,7 +242,7 @@ class LocalNewsCrawler:
             for query in queries:
                 rows = _safe_text_search(ddgs, query)
                 for row in rows:
-                    href = str(row.get("href") or "").strip()
+                    href = str(row.get("href") or row.get("url") or "").strip()
                     if not href or href in seen:
                         continue
                     seen.add(href)
@@ -420,7 +266,7 @@ class LocalNewsCrawler:
                 for query in fallback_queries[:6]:
                     rows = _safe_text_search(ddgs, query)
                     for row in rows:
-                        href = str(row.get("href") or "").strip()
+                        href = str(row.get("href") or row.get("url") or "").strip()
                         if not href or href in seen:
                             continue
                         seen.add(href)
@@ -508,332 +354,327 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _parse_details_kv(details: list[Any]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for line in details:
-        if not isinstance(line, str) or ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        k = key.strip()
-        v = value.strip()
-        if k and v:
-            out[k.lower()] = v
-    return out
-
-
-def _extract_procurement_refs(text: str) -> list[str]:
-    if not text:
-        return []
-    patterns = [
-        r"\b\d{1,4}/[A-Z0-9()\-/]+/[A-Z][A-Z0-9()\-/]+/\d{4}-\d{2,4}\b",
-        r"\bNIT[/\s-]*No\.?\s*[:\-]?\s*[^\s,;]+",
-        r"\bGEM/\d{4,}/[A-Z0-9/\-]+\b",
-    ]
-    found: list[str] = []
-    for pat in patterns:
-        for m in re.finditer(pat, text, flags=re.IGNORECASE):
-            s = m.group(0).strip()
-            if s and s not in found:
-                found.append(s)
-    return found[:12]
-
-
-def _short_work_title(title: str, *, max_words: int = 14) -> str:
-    t = re.sub(r"\s+", " ", (title or "").strip())
-    if not t:
-        return ""
-    words = t.split()
-    if len(words) <= max_words:
-        return t
-    return " ".join(words[:max_words])
-
-
-def _geo_tokens_from_title(title: str) -> list[str]:
-    t = title or ""
-    hits = re.findall(
-        r"\b(?:Circle\s+\d+[A-Z]?|KPHB|Kukatpally|GHMC|Secunderabad|Hyderabad|"
-        r"Telangana|Warangal|Karimnagar|Nizamabad|Medchal|Rangareddy)\b",
-        t,
-        flags=re.IGNORECASE,
-    )
-    seen: set[str] = set()
-    out: list[str] = []
-    for h in hits:
-        v = h.strip()
-        lk = v.lower()
-        if lk not in seen:
-            seen.add(lk)
-            out.append(v)
-    return out
-
-
-def merge_project_intel(doc_analysis: dict[str, Any]) -> dict[str, Any]:
-    """
-    Normalise project/work context for web search and deep research.
-    Prefer LLM `project_intel`; fill gaps from `details` and timeline text.
-    """
-    raw = doc_analysis.get("project_intel")
-    intel: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
-
-    details = doc_analysis.get("details") or []
-    kv = _parse_details_kv([d for d in details if isinstance(d, str)])
-
-    title = str(intel.get("title_or_work") or kv.get("name of work") or "").strip()
-    department = str(intel.get("department") or kv.get("department name") or "").strip()
-    authority = str(
-        intel.get("authority_or_circle")
-        or kv.get("circle/division")
-        or kv.get("circle / division")
-        or ""
-    ).strip()
-    work_type = str(intel.get("work_type") or kv.get("type of work") or "").strip()
-    category = str(intel.get("category") or kv.get("tender category") or "").strip()
-
-    timeline = doc_analysis.get("timeline") or []
-    timeline_blob = " ".join(
-        f"{item.get('event','')} {item.get('date','')} {item.get('evidence','')}"
-        for item in timeline
-        if isinstance(item, dict)
-    )
-    details_blob = " ".join(str(d) for d in details if isinstance(d, str))
-    nit_from_intel = str(intel.get("nit_or_reference") or "").strip()
-    refs = _extract_procurement_refs(" ".join(filter(None, [nit_from_intel, timeline_blob, details_blob])))
-
-    locations = intel.get("locations")
-    if not isinstance(locations, list):
-        locations = []
-    locations = [str(x).strip() for x in locations if isinstance(x, str) and str(x).strip()]
-    for g in _geo_tokens_from_title(title):
-        if g not in locations:
-            locations.append(g)
-
-    year_hint = str(intel.get("year_hint") or "").strip()
-    if not year_hint:
-        ym = re.search(r"\b(20\d{2})\b", timeline_blob + " " + details_blob)
-        if ym:
-            year_hint = ym.group(1)
-
-    intel.setdefault("title_or_work", title)
-    intel.setdefault("department", department)
-    intel.setdefault("authority_or_circle", authority)
-    intel.setdefault("work_type", work_type)
-    intel.setdefault("category", category)
-    intel.setdefault("nit_or_reference", nit_from_intel or (refs[0] if refs else ""))
-    intel.setdefault("procurement_reference_codes", refs)
-    intel.setdefault("locations", locations)
-    intel.setdefault("year_hint", year_hint)
-
-    sq = intel.get("search_queries")
-    if not isinstance(sq, list):
-        sq = []
-    intel["search_queries"] = [str(x).strip() for x in sq if isinstance(x, str) and str(x).strip()]
-    return intel
-
-
-def build_web_queries(
-    tender_id: str,
-    doc_analysis: dict[str, Any],
-    *,
-    project_intel: dict[str, Any],
-    max_queries: int = 42,
-) -> list[str]:
-    """
-    Prefer project/work-specific queries (title, NIT, department, geography).
-    Bare 6-digit portal IDs are poor search keys; when used, always pair with disambiguators.
-    """
-    intel = project_intel
-    title = str(intel.get("title_or_work") or "").strip()
-    short_title = _short_work_title(title)
-    dept = str(intel.get("department") or "").strip()
-    authority = str(intel.get("authority_or_circle") or "").strip()
-    work_type = str(intel.get("work_type") or "").strip()
-    year = str(intel.get("year_hint") or "").strip()
-    nit = str(intel.get("nit_or_reference") or "").strip()
-    refs = intel.get("procurement_reference_codes") or []
-    ref_list = [str(r).strip() for r in refs if isinstance(r, str) and str(r).strip()]
-    locations = [str(x).strip() for x in (intel.get("locations") or []) if str(x).strip()]
-    geo_phrase = " ".join(locations[:4]) if locations else ""
-
-    queries: list[str] = []
-
-    # Model-suggested queries first (should already be project-centric).
-    for q in intel.get("search_queries") or []:
-        if isinstance(q, str) and q.strip():
-            queries.append(q.strip())
-
-    if nit:
-        queries.append(nit)
-        queries.append(f'"{nit}" tender')
-        queries.append(f'"{nit}" GHMC')
-    for ref in ref_list[:6]:
-        if ref != nit:
-            queries.append(ref)
-
-    if short_title:
-        queries.append(f'"{short_title}"')
-        queries.append(f"{short_title} tender Telangana")
-        if dept:
-            queries.append(f"{short_title} {dept}")
-        if year:
-            queries.append(f"{short_title} {year}")
-
-    if dept and work_type:
-        queries.append(f"{dept} {work_type} {year}".strip())
-    if dept and geo_phrase:
-        queries.append(f"{dept} {geo_phrase} {work_type}".strip())
-
-    if title and "GHMC" in title.upper():
-        queries.append(f"site:tender.telangana.gov.in GHMC {_short_work_title(title, max_words=8)}")
-
-    # Portal / news angles (still project words, not ID-only).
-    if short_title:
-        queries.append(f"{short_title} corrigendum")
-        queries.append(f"{short_title} award")
-        queries.append(f"{short_title} eprocurement Telangana")
-
-    # Disambiguated portal ID queries (last resort, not first).
-    disamb = " ".join(x for x in (dept, geo_phrase, year, "Telangana") if x).strip()
-    if disamb:
-        queries.append(f"{tender_id} {disamb} tender")
-        queries.append(f"site:tender.telangana.gov.in {tender_id} {dept.split()[0] if dept else ''}".strip())
-    queries.append(f'"{tender_id}" {short_title or dept or "Telangana"}')
-
-    seen: set[str] = set()
-    unique: list[str] = []
-    for q in queries:
-        qn = re.sub(r"\s+", " ", q).strip()
-        if not qn or qn in seen:
-            continue
-        seen.add(qn)
-        unique.append(qn)
-        if len(unique) >= max_queries:
-            break
-    return unique
-
-
-def collect_tender_data(tender_id: str, output_dir: Path, rate_limit_seconds: float) -> dict[str, Any]:
-    tender_dir = output_dir / tender_id
-    inspect_dir = tender_dir / "inspect"
-    inspect_dir.mkdir(parents=True, exist_ok=True)
-
-    client = TelanganaTenderClient(rate_limit_seconds=rate_limit_seconds)
-    bootstrap_error = ""
-    try:
-        cookies = client.bootstrap_cookies()
-    except Exception as exc:
-        cookies = {}
-        bootstrap_error = str(exc)
+def build_local_source_collection(source_root: Path) -> dict[str, Any]:
+    source_root = source_root.resolve()
+    if not source_root.exists():
+        raise FileNotFoundError(f"source root does not exist: {source_root}")
+    if not source_root.is_dir():
+        raise NotADirectoryError(f"source root is not a directory: {source_root}")
 
     portal_data: dict[str, Any] = {
-        "cookies": cookies,
-        "bootstrap_error": bootstrap_error,
+        "mode": "local_root",
+        "source_root": str(source_root),
         "endpoints": {},
+        "bootstrap_error": "",
+        "local_scan": {
+            "file_count": sum(1 for p in source_root.rglob("*") if p.is_file()),
+        },
     }
 
-    endpoint_calls = [
-        ("general", client.fetch_general_info),
-        ("documents", client.fetch_documents_info),
-        ("award", client.fetch_award_details),
-        ("award_documents", client.fetch_award_documents),
-    ]
-
-    for label, func in endpoint_calls:
-        try:
-            page = func(tender_id)
-            page_json = page.to_json()
-            write_text(inspect_dir / f"{label}.html", page.html_text)
-            write_json(inspect_dir / f"{label}.json", page_json)
-            portal_data["endpoints"][label] = {
-                "status": "ok",
-                "url": page.url,
-                "text_preview": page.text[:600],
-            }
-        except Exception as exc:
-            portal_data["endpoints"][label] = {
-                "status": "error",
-                "error": str(exc),
-            }
-
-    zip_path = tender_dir / f"{tender_id}_documents.zip"
-    extracted_dir = tender_dir / f"{tender_id}_extracted"
-    download_status = {"zip_path": str(zip_path), "extracted_dir": str(extracted_dir), "downloaded": False}
-
-    try:
-        client.download_documents_zip(tender_id, zip_path)
-        download_status["downloaded"] = True
-        download_status["zip_valid"] = validate_zip(zip_path)
-        if download_status["zip_valid"]:
-            extracted_dir.mkdir(parents=True, exist_ok=True)
-            archives = recursive_unzip(zip_path, extracted_dir)
-            download_status["archives_extracted"] = len(archives)
-        else:
-            download_status["archives_extracted"] = 0
-    except Exception as exc:
-        download_status["error"] = str(exc)
-
-    source_dirs: list[Path] = []
-    if extracted_dir.exists() and any(extracted_dir.rglob("*")):
-        source_dirs.append(extracted_dir)
-    if inspect_dir.exists() and any(inspect_dir.rglob("*")):
-        source_dirs.append(inspect_dir)
-
     return {
-        "tender_dir": str(tender_dir),
-        "inspect_dir": str(inspect_dir),
+        "tender_dir": str(source_root),
+        "inspect_dir": str(source_root),
         "portal_data": portal_data,
-        "download_status": download_status,
-        "source_dirs": [str(p) for p in source_dirs],
+        "download_status": {
+            "zip_path": "",
+            "extracted_dir": str(source_root),
+            "downloaded": False,
+            "source_root": str(source_root),
+        },
+        "source_dirs": [str(source_root)],
     }
 
 
 def analyze_documents(
-    llm: OllamaChatClient,
+    llm: OpenRouterChatClient,
     tender_id: str,
     docs: list[dict[str, str]],
     portal_data: dict[str, Any],
 ) -> dict[str, Any]:
     manifest = [{"path": d["path"], "chars": len(d["text"])} for d in docs]
-    snippets = [{"path": d["path"], "snippet": d["text"][:2500]} for d in docs[:18]]
+    snippets = [{"path": d["path"], "snippet": d["text"][:3000]} for d in docs[:22]]
+
+    doc1_prompt = """
+You are a tender-analysis assistant designed to help ordinary citizens understand government tenders.
+
+Your job is to read a tender document and extract the most important information in a citizen-friendly way. Focus on public impact, money, timing, location, accountability, and practical relevance. Avoid procurement jargon where possible.
+
+For every tender, produce output with the following sections:
+
+Tender overview
+Tender title
+Tender ID / reference number
+Issuing authority / department
+Publication date
+Closing date and time
+Status: open, upcoming, amended, cancelled, awarded, or unknown
+
+What is being procured
+Plain-English summary of the project
+Category: construction, road, IT, health, education, goods, services, consultancy, etc.
+Scope of work
+Deliverables / outputs
+Quantity or scale
+Location(s) affected
+Whether it is a one-time project or ongoing contract
+
+Why citizens should care
+Public benefit or service impact
+Who benefits directly
+Possible disruptions or inconveniences
+Whether it affects daily life, taxes, transport, health, schools, utilities, jobs, or the environment
+
+Money and timeline
+Estimated contract value / budget
+Funding source, if stated
+Expected duration
+Start and end dates, if available
+
+Award information
+Who the contract was awarded to
+Awarded amount / contract value at award, if available
+Date of award, if available
+If not yet awarded, explicitly state "not stated"
+
+Bidding and eligibility
+Who can bid
+Required qualifications, experience, or certifications
+Bid security / deposit / earnest money
+Pre-bid meeting date, if any
+Site visit requirement, if any
+Submission method and deadline
+Selection process and evaluation criteria, if stated
+
+Risks, watch-outs, and accountability
+Key deadlines
+Unusual or restrictive conditions
+Short bidding windows
+Vague scope
+Single-bid risk
+Amendments or extensions
+Complaint / grievance channel
+Link or reference to original documents, if present
+
+Citizen-friendly summary
+Write 3–10 short bullet points explaining the tender in plain language for a general audience. Ensure that it is a balanced summary giving the pros and cons of the development project while keeping in mind the benefit of the citizens.
+
+Red flags
+List any potentially concerning issues, such as:
+unusually short deadline
+unclear requirements
+narrow eligibility
+repeated extensions
+missing budget information
+excessive restrictions
+high-value contract with low transparency
+
+Rules:
+Be accurate and only use information supported by the tender text.
+If a field is missing, write “not stated.”
+Translate technical language into plain English.
+Keep the summary concise and useful for non-experts.
+If the tender contains numbers, dates, places, or eligibility rules, extract them exactly.
+Do not speculate. If something is unclear, say so.
+Source hierarchy: Primary NIT page > tender tables > annexures/instructions/repeated excerpts.
+If sources disagree, report disagreement instead of forcing one value.
+Internal consistency checks before finalizing: estimated value vs EMD, submission dates across sections, duration consistency, mandatory docs consistency, authority/location/completion contradictions. Ensure that all information is accurate and complete.
+
+Return JSON matching this schema:
+
+{
+"type": "object",
+"additionalProperties": false,
+"required": [
+"tender_overview",
+"what_is_being_procured",
+"why_citizens_should_care",
+"money_and_timeline",
+"bidding_and_eligibility",
+"award_information",
+"risks_watchouts_and_accountability",
+"citizen_friendly_summary",
+"red_flags"
+],
+"properties": {
+"tender_overview": {
+"type": "object",
+"additionalProperties": false,
+"required": [
+"tender_title",
+"tender_id",
+"issuing_authority",
+"publication_date",
+"closing_date_time",
+"status"
+],
+"properties": {
+"tender_title": { "type": "string" },
+"tender_id": { "type": "string" },
+"issuing_authority": { "type": "string" },
+"publication_date": { "type": "string" },
+"closing_date_time": { "type": "string" },
+"status": {
+"type": "string",
+"enum": ["open", "upcoming", "amended", "cancelled", "awarded", "unknown"]
+}
+}
+},
+
+"what_is_being_procured": {
+"type": "object",
+"additionalProperties": false,
+"required": [
+"plain_english_summary",
+"category",
+"scope_of_work",
+"deliverables",
+"quantity_or_scale",
+"locations_affected",
+"contract_type"
+],
+"properties": {
+"plain_english_summary": { "type": "string" },
+"category": { "type": "string" },
+"scope_of_work": { "type": "string" },
+"deliverables": { "type": "string" },
+"quantity_or_scale": { "type": "string" },
+"locations_affected": { "type": "string" },
+"contract_type": { "type": "string" }
+}
+},
+
+"why_citizens_should_care": {
+"type": "object",
+"additionalProperties": false,
+"required": [
+"public_benefit_or_service_impact",
+"direct_beneficiaries",
+"possible_disruptions",
+"daily_life_impact"
+],
+"properties": {
+"public_benefit_or_service_impact": { "type": "string" },
+"direct_beneficiaries": { "type": "string" },
+"possible_disruptions": { "type": "string" },
+"daily_life_impact": { "type": "string" }
+}
+},
+
+"money_and_timeline": {
+"type": "object",
+"additionalProperties": false,
+"required": [
+"estimated_contract_value",
+"funding_source",
+"expected_duration",
+"start_date",
+"end_date"
+],
+"properties": {
+"estimated_contract_value": { "type": "string" },
+"funding_source": { "type": "string" },
+"expected_duration": { "type": "string" },
+"start_date": { "type": "string" },
+"end_date": { "type": "string" }
+}
+},
+
+"bidding_and_eligibility": {
+"type": "object",
+"additionalProperties": false,
+"required": [
+"who_can_bid",
+"required_qualifications",
+"bid_security",
+"pre_bid_meeting",
+"site_visit_requirement",
+"submission_method",
+"selection_process",
+"evaluation_criteria"
+],
+"properties": {
+"who_can_bid": { "type": "string" },
+"required_qualifications": { "type": "string" },
+"bid_security": { "type": "string" },
+"pre_bid_meeting": { "type": "string" },
+"site_visit_requirement": { "type": "string" },
+"submission_method": { "type": "string" },
+"selection_process": { "type": "string" },
+"evaluation_criteria": { "type": "string" }
+}
+},
+
+"award_information": {
+"type": "object",
+"additionalProperties": false,
+"required": [
+"awarded_to",
+"awarded_amount",
+"award_date"
+],
+"properties": {
+"awarded_to": { "type": "string" },
+"awarded_amount": { "type": "string" },
+"award_date": { "type": "string" }
+}
+},
+
+"risks_watchouts_and_accountability": {
+"type": "object",
+"additionalProperties": false,
+"required": [
+"key_deadlines",
+"unusual_or_restrictive_conditions",
+"short_bidding_window",
+"vague_scope",
+"single_bid_risk",
+"amendments_or_extensions",
+"grievance_channel",
+"original_document_reference"
+],
+"properties": {
+"key_deadlines": { "type": "string" },
+"unusual_or_restrictive_conditions": { "type": "string" },
+"short_bidding_window": { "type": "string" },
+"vague_scope": { "type": "string" },
+"single_bid_risk": { "type": "string" },
+"amendments_or_extensions": { "type": "string" },
+"grievance_channel": { "type": "string" },
+"misc": { "type": "string" },
+"original_document_reference": { "type": "string" }
+}
+},
+
+"citizen_friendly_summary": {
+"type": "array",
+"items": { "type": "string" },
+"minItems": 3,
+"maxItems": 10
+},
+
+"red_flags": {
+"type": "array",
+"items": { "type": "string" }
+}
+
+}
+}
+""".strip()
 
     messages = [
         {
             "role": "system",
             "content": (
-                "You are a tender analyst. Extract key facts from tender portal data and documents. "
-                "Return JSON only."
+                "You are a tender-analysis assistant for government procurement documents. "
+                "Use only directly supported facts. Return JSON only."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Tender ID: {tender_id}\n"
-                "Return JSON schema:\n"
-                "{"
-                "\"tender_id\":\"...\","
-                "\"status\":\"awarded|not_awarded|unknown\","
-                "\"awarded_by\":{\"value\":\"...\",\"evidence\":[\"...\"]}|null,"
-                "\"awarded_to\":{\"value\":\"...\",\"evidence\":[\"...\"]}|null,"
-                "\"details\":[\"...\"],"
-                "\"timeline\":[{\"event\":\"...\",\"date\":\"...\",\"evidence\":\"...\"}],"
-                "\"contract_value\":{\"amount\":\"...\",\"evidence\":[\"...\"]}|null,"
-                "\"extra_points\":[{\"point\":\"...\",\"evidence\":\"...\"}],"
-                "\"project_intel\":{"
-                "\"title_or_work\":\"exact Name of Work / scope\","
-                "\"department\":\"...\","
-                "\"authority_or_circle\":\"...\","
-                "\"nit_or_reference\":\"NIT / enquiry / schedule ref if any\","
-                "\"locations\":[\"KPHB\",\"Kukatpally\", \"...\"],"
-                "\"work_type\":\"...\","
-                "\"category\":\"...\","
-                "\"year_hint\":\"20xx\","
-                "\"search_queries\":[\"12-22 web search strings for THIS project — use work title, department, "
-                "NIT/ref, geography, work type; do NOT use only the 6-digit portal tender id\"]"
-                "},"
-                "\"confidence\":0.0,"
-                "\"gaps\":[\"...\"],"
-                "\"sources_used\":[\"...\"]"
-                "}\n\n"
-                f"Portal data summary:\n{json.dumps(portal_data, ensure_ascii=True)[:20000]}\n\n"
+                f"Tender ID: {tender_id}\n\n"
+                f"{doc1_prompt}\n\n"
+                f"Portal data summary:\n{json.dumps(portal_data, ensure_ascii=True)[:22000]}\n\n"
                 f"Document manifest:\n{json.dumps(manifest, ensure_ascii=True)}\n\n"
                 f"Document snippets:\n{json.dumps(snippets, ensure_ascii=True)}"
             ),
@@ -847,31 +688,328 @@ def analyze_documents(
             raise ValueError("document analysis returned non-object JSON")
     except Exception as exc:
         payload = {
-            "tender_id": tender_id,
-            "status": "unknown",
-            "awarded_by": None,
-            "awarded_to": None,
-            "details": [],
-            "timeline": [],
-            "contract_value": None,
-            "extra_points": [],
-            "project_intel": {},
-            "confidence": 0.0,
-            "gaps": [f"Document analysis failed: {exc}"],
-            "sources_used": [],
+            "tender_overview": {
+                "tender_title": "not stated",
+                "tender_id": tender_id,
+                "issuing_authority": "not stated",
+                "publication_date": "not stated",
+                "closing_date_time": "not stated",
+                "status": "unknown",
+            },
+            "what_is_being_procured": {
+                "plain_english_summary": "not stated",
+                "category": "not stated",
+                "scope_of_work": "not stated",
+                "deliverables": "not stated",
+                "quantity_or_scale": "not stated",
+                "locations_affected": "not stated",
+                "contract_type": "not stated",
+            },
+            "why_citizens_should_care": {
+                "public_benefit_or_service_impact": "not stated",
+                "direct_beneficiaries": "not stated",
+                "possible_disruptions": "not stated",
+                "daily_life_impact": "not stated",
+            },
+            "money_and_timeline": {
+                "estimated_contract_value": "not stated",
+                "funding_source": "not stated",
+                "expected_duration": "not stated",
+                "start_date": "not stated",
+                "end_date": "not stated",
+            },
+            "bidding_and_eligibility": {
+                "who_can_bid": "not stated",
+                "required_qualifications": "not stated",
+                "bid_security": "not stated",
+                "pre_bid_meeting": "not stated",
+                "site_visit_requirement": "not stated",
+                "submission_method": "not stated",
+                "selection_process": "not stated",
+                "evaluation_criteria": "not stated",
+            },
+            "award_information": {
+                "awarded_to": "not stated",
+                "awarded_amount": "not stated",
+                "award_date": "not stated",
+            },
+            "risks_watchouts_and_accountability": {
+                "key_deadlines": "not stated",
+                "unusual_or_restrictive_conditions": "not stated",
+                "short_bidding_window": "not stated",
+                "vague_scope": "not stated",
+                "single_bid_risk": "not stated",
+                "amendments_or_extensions": "not stated",
+                "grievance_channel": "not stated",
+                "misc": f"Document analysis failed: {exc}",
+                "original_document_reference": "not stated",
+            },
+            "citizen_friendly_summary": [
+                "Tender extraction failed; key values are marked as not stated.",
+                "Verify source tender files and rerun the pipeline.",
+                "Use official tender portal details for final validation.",
+            ],
+            "red_flags": [f"Document analysis failed: {exc}"],
         }
 
-    payload.setdefault("tender_id", tender_id)
+    payload.setdefault("tender_overview", {})
+    if isinstance(payload.get("tender_overview"), dict):
+        payload["tender_overview"].setdefault("tender_id", tender_id)
+
+    inferred_award = infer_award_information_from_docs(docs)
+    award_info = payload.get("award_information")
+    if not isinstance(award_info, dict):
+        award_info = {
+            "awarded_to": "not stated",
+            "awarded_amount": "not stated",
+            "award_date": "not stated",
+        }
+    for key in ("awarded_to", "awarded_amount", "award_date"):
+        cur = str(award_info.get(key) or "").strip().lower()
+        if not cur or cur in {"not stated", "unknown", "unclear", "not found"}:
+            award_info[key] = inferred_award.get(key, "not stated")
+    payload["award_information"] = award_info
+
     return payload
 
 
-def summarize_web_findings(
-    llm: OllamaChatClient,
+def _safe_get(d: dict[str, Any], path: list[str], default: str = "") -> str:
+    cur: Any = d
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return str(cur).strip() if cur is not None else default
+
+
+def infer_award_information_from_docs(docs: list[dict[str, str]]) -> dict[str, str]:
+    merged = "\n".join((d.get("text") or "")[:8000] for d in docs[:40])
+    compact = " ".join(merged.split())
+
+    awarded_to = "not stated"
+    awarded_amount = "not stated"
+    award_date = "not stated"
+
+    awarded_to_patterns = [
+        r"(?:awarded to|awarded in favour of|work awarded to|successful bidder|l1 bidder)\s*[:\-]?\s*([A-Za-z0-9&.,()'\-/ ]{3,140})",
+    ]
+    for pattern in awarded_to_patterns:
+        m = re.search(pattern, compact, flags=re.IGNORECASE)
+        if m:
+            candidate = re.split(r"(?:\.|;|,\s+at\s+|,\s+for\s+)", m.group(1).strip())[0].strip(" -:")
+            if len(candidate) >= 3:
+                awarded_to = candidate
+                break
+
+    amount_patterns = [
+        r"(?:award(?:ed)? amount|contract value|accepted value|awarded value|work value)\s*[:\-]?\s*(Rs\.?\s*[\d,]+(?:\.\d+)?(?:\s*(?:crore|lakh))?)",
+        r"\b(Rs\.?\s*[\d,]{4,}(?:\.\d+)?(?:\s*(?:crore|lakh))?)\b",
+    ]
+    for pattern in amount_patterns:
+        m = re.search(pattern, compact, flags=re.IGNORECASE)
+        if m:
+            awarded_amount = m.group(1).strip()
+            break
+
+    date_patterns = [
+        r"(?:date of award|awarded on|work order date|loa date|letter of acceptance date)\s*[:\-]?\s*([0-3]?\d[\-/][01]?\d[\-/]\d{2,4})",
+        r"(?:date of award|awarded on|work order date|loa date|letter of acceptance date)\s*[:\-]?\s*([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})",
+    ]
+    for pattern in date_patterns:
+        m = re.search(pattern, compact, flags=re.IGNORECASE)
+        if m:
+            award_date = m.group(1).strip()
+            break
+
+    return {
+        "awarded_to": awarded_to,
+        "awarded_amount": awarded_amount,
+        "award_date": award_date,
+    }
+
+
+def extract_identifiers_from_text(text: str) -> dict[str, list[str]]:
+    content = (text or "").upper()
+    gstin_re = r"\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b"
+    cin_re = r"\b[L|U]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}\b"
+    pan_re = r"\b[A-Z]{5}\d{4}[A-Z]\b"
+
+    gstins = sorted(set(re.findall(gstin_re, content)))
+    cins = sorted(set(re.findall(cin_re, content)))
+    pans = sorted(set(re.findall(pan_re, content)))
+    return {"gstin": gstins, "cin": cins, "pan": pans}
+
+
+def merge_identifier_map(base: dict[str, Any], extra: dict[str, list[str]]) -> dict[str, list[str]]:
+    out = {
+        "gstin": [],
+        "cin": [],
+        "pan": [],
+    }
+    for key in out:
+        base_values = base.get(key) if isinstance(base, dict) else []
+        merged = []
+        seen: set[str] = set()
+        for value in list(base_values or []) + list(extra.get(key) or []):
+            v = str(value).strip().upper()
+            if not v or v in seen:
+                continue
+            seen.add(v)
+            merged.append(v)
+        out[key] = merged
+    return out
+
+
+def fetch_gst_lookup_data(entity_name: str, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
+    lookup_url = "https://www.knowyourgst.com/gst-number-search/by-name-pan/"
+    clean_name = re.sub(r"\s+", " ", (entity_name or "")).strip()
+    if not clean_name:
+        return {
+            "lookup_url": lookup_url,
+            "entity_query": "",
+            "http_status": None,
+            "matched_rows": [],
+            "raw_text_excerpt": "",
+            "error": "Empty entity name for GST lookup",
+        }
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    try:
+        response = requests.post(
+            lookup_url,
+            data={"gstnum": clean_name},
+            headers=headers,
+            timeout=timeout_seconds,
+        )
+        response.raise_for_status()
+    except Exception as exc:
+        return {
+            "lookup_url": lookup_url,
+            "entity_query": clean_name,
+            "http_status": None,
+            "matched_rows": [],
+            "raw_text_excerpt": "",
+            "error": f"GST lookup failed: {exc}",
+        }
+
+    matched_rows: list[dict[str, str]] = []
+    raw_text_excerpt = ""
+    parse_error = ""
+    try:
+        doc = lxml_html.fromstring(response.text)
+        for tr in doc.xpath("//table//tr")[:80]:
+            cells = [" ".join((td.text_content() or "").split()) for td in tr.xpath("./th|./td")]
+            cells = [c for c in cells if c]
+            if not cells:
+                continue
+            row: dict[str, str]
+            if len(cells) >= 2:
+                row = {"field": cells[0], "value": " | ".join(cells[1:])}
+            else:
+                row = {"field": "row", "value": cells[0]}
+            matched_rows.append(row)
+            if len(matched_rows) >= 80:
+                break
+
+        raw_text = " ".join((doc.text_content() or "").split())
+        raw_text_excerpt = raw_text[:5000]
+    except Exception as exc:
+        parse_error = f"GST HTML parse failed: {exc}"
+
+    return {
+        "lookup_url": lookup_url,
+        "entity_query": clean_name,
+        "http_status": response.status_code,
+        "matched_rows": matched_rows,
+        "raw_text_excerpt": raw_text_excerpt,
+        "error": parse_error,
+    }
+
+
+def derive_step2_queries(llm: OpenRouterChatClient, tender_id: str, document1: dict[str, Any], *, max_queries: int = 15) -> list[str]:
+    summary_old = document1.get("tender_summary") if isinstance(document1.get("tender_summary"), dict) else {}
+    scope_old = document1.get("scope") if isinstance(document1.get("scope"), dict) else {}
+    overview_new = document1.get("tender_overview") if isinstance(document1.get("tender_overview"), dict) else {}
+    procured_new = document1.get("what_is_being_procured") if isinstance(document1.get("what_is_being_procured"), dict) else {}
+
+    title = _safe_get(summary_old, ["title"]) or _safe_get(overview_new, ["tender_title"])
+    department = _safe_get(summary_old, ["department"]) or _safe_get(overview_new, ["issuing_authority"])
+    notice_number = _safe_get(summary_old, ["notice_number"]) or _safe_get(overview_new, ["tender_id"])
+    category = _safe_get(summary_old, ["category"]) or _safe_get(procured_new, ["category"])
+    location = _safe_get(scope_old, ["location"]) or _safe_get(procured_new, ["locations_affected"])
+
+    try:
+        ctx_str = f"Title: {title}\nDepartment: {department}\nLocation: {location}\nCategory: {category}"
+        msgs = [
+            {"role": "system", "content": "You are an OSINT researcher. Generate a list of precise DuckDuckGo search queries (strings) to find news about the following tender. Output ONLY a valid JSON array of strings."},
+            {"role": "user", "content": f"Tender context:\n{ctx_str}\n\nTender ID: {tender_id}\nTarget topics: Construction delays, civic complaints, contractor scams, status updates.\nGenerate up to {max_queries} varied and specific queries. Return JSON array of strings ONLY."}
+        ]
+        resp = llm.chat(msgs, max_tokens=1000)
+        resp = resp.strip()
+        if resp.startswith("```json"): resp = resp[7:]
+        if resp.startswith("```"): resp = resp[3:]
+        if resp.endswith("```"): resp = resp[:-3]
+        parsed = json.loads(resp.strip())
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed[:max_queries]]
+    except Exception:
+        pass
+
+    awards = document1.get("award_information", {})
+    if not isinstance(awards, dict): awards = {}
+    awarded_entity = str(awards.get("awarded_to") or "").replace("not stated", "").strip()
+
+    words = [w for w in re.findall(r'\b[a-zA-Z]{4,}\b', title) if w.lower() not in {"this", "that", "with", "from", "under", "period", "months", "days", "work", "maintenance"}]
+    title_keywords = " ".join(words[:5])
+
+    dept_short = " ".join(re.findall(r'\b[a-zA-Z]{3,}\b', department)[:3])
+    loc_short = " ".join(re.findall(r'\b[a-zA-Z]{3,}\b', location)[:3])
+
+    seeds = [
+        f'"{tender_id}" {dept_short} tender',
+        f'{title_keywords} {loc_short} construction delay OR issue OR problem',
+        f'{title_keywords} {loc_short} civic complain OR news',
+        f'{loc_short} {category} {dept_short} contractor scam OR blacklist OR irregularities',
+    ]
+
+    if len(awarded_entity) > 3 and awarded_entity.lower() != "unknown":
+        comp_name = " ".join(re.findall(r'\b[a-zA-Z0-9]{3,}\b', awarded_entity)[:4])
+        if comp_name:
+            seeds.append(f'"{comp_name}" contractor reviews OR scam OR issue')
+            seeds.append(f'"{comp_name}" {dept_short} contract')
+
+    seeds.append(f'site:tender.telangana.gov.in {tender_id}')
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for q in seeds:
+        qq = re.sub(r"\s+", " ", q).strip()
+        if not qq or len(qq) < 5 or qq in seen:
+            continue
+        seen.add(qq)
+        out.append(qq)
+        if len(out) >= max_queries:
+            break
+    return out
+
+
+def build_document2(
+    llm: OpenRouterChatClient,
     tender_id: str,
-    pages: list[dict[str, str]],
+    document1: dict[str, Any],
+    crawler: LocalNewsCrawler,
     *,
-    project_intel: dict[str, Any],
-) -> dict[str, Any]:
+    search_results_per_query: int,
+    crawl_max_pages: int,
+    crawl_max_chars: int,
+) -> tuple[dict[str, Any], list[SearchResult], list[dict[str, str]]]:
+    queries = derive_step2_queries(llm, tender_id, document1)
+    results = crawler.search(queries, max_results_per_query=search_results_per_query)
+    pages = crawler.crawl(results, max_pages=max(1, crawl_max_pages), max_chars=max(2000, crawl_max_chars))
+
     compact_pages = [
         {
             "url": page.get("url", ""),
@@ -885,1192 +1023,338 @@ def summarize_web_findings(
     ]
 
     messages = [
-        {
-            "role": "system",
-            "content": "You are a web research analyst. Return JSON only.",
-        },
+        {"role": "system", "content": "You are a procurement news researcher. Respond in English only and return strict JSON only."},
         {
             "role": "user",
             "content": (
                 f"Tender ID: {tender_id}\n"
-                f"Project context (use to judge relevance, not only the id):\n"
-                f"{json.dumps(project_intel, ensure_ascii=True)[:8000]}\n"
-                "From crawled web pages, extract relevant external context and news references.\n"
-                "Prefer sources about THIS work / department / geography / NIT reference — ignore unrelated tenders "
-                "that merely share a generic id.\n"
-                "Return JSON schema:\n"
-                "{"
-                "\"relevant_news\":[{\"title\":\"...\",\"url\":\"...\",\"summary\":\"...\",\"relevance\":\"high|medium|low\"}],"
-                "\"signals\":[\"...\"],"
-                "\"risks\":[\"...\"],"
-                "\"confidence\":0.0"
+                "Review the tender data and crawled news pages.\n"
+                "Identify and summarize the news that is relevant to this tender (work type, department, location, timeline, vendors).\n"
+                "Ignore irrelevant pages.\n"
+                "List the sources used.\n\n"
+                "Important constraints:\n"
+                "1) Output must be in English only.\n"
+                "2) Use only the provided crawled pages as source evidence.\n"
+                "3) If nothing relevant is found, say so clearly in English and keep sources empty.\n\n"
+                "Return strict JSON matching this schema:\n"
+                "{\n"
+                "  \"overall_summary\": \"High level overview of news and public information retrieved related to the project context.\",\n"
+                "  \"tender_specific_news\": \"Any mentions of this specific tender ID, process, delays, or status directly.\",\n"
+                "  \"market_and_location_context\": \"Context on the contracting department, vendor, geographic project location, or similar historical projects from the news.\",\n"
+                "  \"sources\": [{\"title\":\"\",\"url\":\"\",\"relevance\":\"high|medium|low\"}]\n"
                 "}\n\n"
-                f"Pages:\n{json.dumps(compact_pages, ensure_ascii=True)}"
+                f"Document 1 (Tender Data):\n{json.dumps(document1, ensure_ascii=True)[:22000]}\n\n"
+                f"Crawled News Pages:\n{json.dumps(compact_pages, ensure_ascii=True)[:120000]}"
             ),
         },
     ]
 
-    try:
-        output = llm.chat(messages, temperature=0.0, max_tokens=2400, num_ctx=32768)
-        payload = extract_json_object(output)
-        if not isinstance(payload, dict):
-            raise ValueError("web summary returned non-object JSON")
-    except Exception as exc:
-        payload = {
-            "relevant_news": [],
-            "signals": [],
-            "risks": [f"Web summary failed: {exc}"],
-            "confidence": 0.0,
-        }
-    return payload
+    def _normalize_payload(raw: dict[str, Any]) -> dict[str, Any]:
+        overall = raw.get("overall_summary")
+        if not isinstance(overall, str) or not overall.strip():
+            overall = "No clearly relevant overall news could be confirmed from crawled sources."
+            
+        specific = raw.get("tender_specific_news", "No specific news found.")
+        market = raw.get("market_and_location_context", "No market context found.")
 
+        normalized_sources: list[dict[str, str]] = []
+        sources = raw.get("sources")
+        if isinstance(sources, list):
+            for src in sources:
+                if not isinstance(src, dict):
+                    continue
+                title = str(src.get("title") or "").strip()
+                url = str(src.get("url") or "").strip()
+                relevance = str(src.get("relevance") or "low").strip().lower()
+                if relevance not in {"high", "medium", "low"}:
+                    relevance = "low"
+                if not title and not url:
+                    continue
+                normalized_sources.append({"title": title, "url": url, "relevance": relevance})
+                if len(normalized_sources) >= 20:
+                    break
 
-def synthesize_final_report(
-    llm: OllamaChatClient,
-    tender_id: str,
-    doc_analysis: dict[str, Any],
-    web_summary: dict[str, Any],
-    deepresearch: dict[str, Any],
-    *,
-    project_intel: dict[str, Any],
-    max_tokens: int = 6000,
-    num_ctx: int = 65536,
-) -> dict[str, Any]:
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a senior procurement investigator producing an exhaustive tender intelligence report. "
-                "You MUST be extremely detailed and cite evidence (quotes + sources). Return JSON only."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Tender ID: {tender_id}\n"
-                f"Project / work context (primary identity for this procurement):\n"
-                f"{json.dumps(project_intel, ensure_ascii=True)[:16000]}\n"
-                "Merge internal tender analysis with deep web/file DeepResearch findings.\n"
-                "When describing external research, tie it to THIS work (title, department, geography, NIT/ref) — "
-                "not unrelated tenders that share a generic portal id.\n"
-                "Return JSON schema:\n"
-                "{"
-                "\"tender_id\":\"...\","
-                "\"executive_summary\":\"...\","
-                "\"status\":\"awarded|not_awarded|unknown\","
-                "\"awarded_by\":\"...\","
-                "\"awarded_to\":\"...\","
-                "\"key_points\":[\"...\"],"
-                "\"timeline\":[{\"event\":\"...\",\"date\":\"...\"}],"
-                "\"web_signals\":[\"...\"],"
-                "\"risks\":[\"...\"],"
-                "\"red_flags\":[{\"flag\":\"...\",\"why\":\"...\",\"evidence\":[\"...\"]}],"
-                "\"news_and_updates\":[{\"title\":\"...\",\"url\":\"...\",\"what_changed\":\"...\",\"date\":\"...\",\"relevance\":\"high|medium|low\"}],"
-                "\"file_findings\":[{\"file\":\"...\",\"highlights\":[\"...\"],\"key_quotes\":[\"...\"]}],"
-                "\"open_questions\":[\"...\"],"
-                "\"sources\":{\"files\":[\"...\"],\"urls\":[\"...\"]},"
-                "\"confidence\":0.0"
-                "}\n\n"
-                f"Document analysis:\n{json.dumps(doc_analysis, ensure_ascii=True)}\n\n"
-                f"Web summary:\n{json.dumps(web_summary, ensure_ascii=True)}\n\n"
-                f"DeepResearch ledger:\n{json.dumps(deepresearch, ensure_ascii=True)[:220000]}"
-            ),
-        },
-    ]
-
-    try:
-        output = llm.chat(
-            messages,
-            temperature=0.0,
-            max_tokens=max_tokens,
-            num_ctx=num_ctx,
-        )
-        payload = extract_json_object(output)
-        if not isinstance(payload, dict):
-            raise ValueError("final synthesis returned non-object JSON")
-    except Exception as exc:
-        payload = {
-            "tender_id": tender_id,
-            "executive_summary": "Unable to synthesize final report.",
-            "status": str(doc_analysis.get("status") or "unknown"),
-            "awarded_by": str((doc_analysis.get("awarded_by") or {}).get("value") or ""),
-            "awarded_to": str((doc_analysis.get("awarded_to") or {}).get("value") or ""),
-            "key_points": [],
-            "timeline": [],
-            "web_signals": [],
-            "risks": [f"Final synthesis failed: {exc}"],
-            "red_flags": [],
-            "news_and_updates": [],
-            "file_findings": [],
-            "open_questions": [],
-            "sources": {"files": [], "urls": []},
-            "confidence": 0.0,
+        return {
+            "overall_summary": overall.strip(),
+            "tender_specific_news": specific if isinstance(specific, str) else str(specific),
+            "market_and_location_context": market if isinstance(market, str) else str(market),
+            "sources": normalized_sources
         }
 
-    payload.setdefault("tender_id", tender_id)
-    return payload
+    def _summary_unusable(summary: str) -> bool:
+        s = (summary or "").strip()
+        if not s:
+            return True
+        if re.search(r"[\u4e00-\u9fff]", s):
+            return True
+        lowered = s.lower()
+        blocked_phrases = [
+            "unable to provide",
+            "cannot provide",
+            "i cannot",
+            "\u65e0\u6cd5",
+            "\u4f60\u597d",
+        ]
+        if any(p in lowered for p in blocked_phrases):
+            return True
+        return False
 
+    def _keyword_tokens() -> list[str]:
+        summary_old = document1.get("tender_summary") if isinstance(document1.get("tender_summary"), dict) else {}
+        scope_old = document1.get("scope") if isinstance(document1.get("scope"), dict) else {}
+        overview_new = document1.get("tender_overview") if isinstance(document1.get("tender_overview"), dict) else {}
+        procured_new = document1.get("what_is_being_procured") if isinstance(document1.get("what_is_being_procured"), dict) else {}
+        raw_parts = [
+            tender_id,
+            _safe_get(summary_old, ["title"]) or _safe_get(overview_new, ["tender_title"]),
+            _safe_get(summary_old, ["work_name"]) or _safe_get(procured_new, ["plain_english_summary"]),
+            _safe_get(summary_old, ["department"]) or _safe_get(overview_new, ["issuing_authority"]),
+            _safe_get(summary_old, ["notice_number"]) or _safe_get(overview_new, ["tender_id"]),
+            _safe_get(scope_old, ["location"]) or _safe_get(procured_new, ["locations_affected"]),
+        ]
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for part in raw_parts:
+            for tok in re.split(r"[^a-zA-Z0-9]+", (part or "").lower()):
+                if len(tok) < 3:
+                    continue
+                if tok in seen:
+                    continue
+                seen.add(tok)
+                tokens.append(tok)
+        return tokens
 
-def _dedupe_place_queries(names: list[str], *, limit: int) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in names:
-        n = re.sub(r"\s+", " ", (raw or "").strip())[:120]
-        if len(n) < 2:
-            continue
-        key = n.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(n)
-        if len(out) >= limit:
-            break
-    return out
-
-
-def collect_candidate_place_names(
-    project_intel: dict[str, Any],
-    doc_analysis: dict[str, Any],
-    deepresearch: dict[str, Any],
-    *,
-    max_candidates: int = 48,
-) -> list[str]:
-    candidates: list[str] = []
-
-    locs = project_intel.get("locations") or []
-    if isinstance(locs, list):
-        candidates.extend(str(x).strip() for x in locs if isinstance(x, str) and str(x).strip())
-
-    title = str(project_intel.get("title_or_work") or "")
-    for part in re.split(r"[,;]|\bin\b|\bat\b|\bnear\b", title, flags=re.IGNORECASE):
-        p = part.strip()
-        if len(p) >= 4 and not re.fullmatch(r"\d+[A-Za-z]?", p):
-            candidates.append(p)
-
-    details = doc_analysis.get("details") or []
-    if isinstance(details, list):
-        for line in details:
-            if not isinstance(line, str):
-                continue
-            if re.search(r"\b(location|address|district|mandal|village|city|area|zone)\b", line, re.I):
-                idx = line.find(":")
-                if idx != -1:
-                    tail = line[idx + 1 :].strip()
-                    if len(tail) >= 3:
-                        candidates.append(tail[:200])
-
-    ev = deepresearch.get("evidence") if isinstance(deepresearch, dict) else None
-    ent = (ev or {}).get("entities") if isinstance(ev, dict) else None
-    if isinstance(ent, dict):
-        locblock = ent.get("locations") or []
-        if isinstance(locblock, list):
-            candidates.extend(str(x).strip() for x in locblock if isinstance(x, str) and str(x).strip())
-
-    notes = deepresearch.get("research_notes") if isinstance(deepresearch, dict) else None
-    if isinstance(notes, list):
-        blob = " ".join(str(x) for x in notes[:40] if isinstance(x, str))
-        for m in re.finditer(
-            r"\b(?:in|at|near)\s+([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,5})\b",
-            blob,
-        ):
-            candidates.append(m.group(1).strip())
-
-    return _dedupe_place_queries(candidates, limit=max_candidates)
-
-
-def _map_links_for_coordinates(lat: float, lon: float) -> dict[str, str]:
-    """
-    Prefer stable map URLs for humans. www.openstreetmap.org often returns 429 via Varnish
-    when using ?mlat= / ?mlon= query patterns; Google Maps + OSM hash viewer are more reliable.
-    """
-    return {
-        "map_link": f"https://www.google.com/maps?q={lat},{lon}&z=16",
-        "google_maps": f"https://www.google.com/maps?q={lat},{lon}&z=16",
-        "openstreetmap": f"https://www.openstreetmap.org/#map=16/{lat}/{lon}",
-        "geo_uri": f"geo:{lat},{lon}",
-    }
-
-
-def _nominatim_region_suffix(project_intel: dict[str, Any]) -> str:
-    title = (str(project_intel.get("title_or_work") or "") + str(project_intel.get("department") or "")).upper()
-    loc_blob = " ".join(str(x) for x in (project_intel.get("locations") or []) if isinstance(x, str)).upper()
-    if "GHMC" in title or "HYDERABAD" in title or "KUKATPALLY" in title or "KPHB" in loc_blob:
-        return ", Hyderabad, Telangana, India"
-    if "TELANGANA" in title or "TELANGANA" in loc_blob:
-        return ", Telangana, India"
-    return ", India"
-
-
-def _nominatim_get_with_backoff(
-    session: requests.Session,
-    url: str,
-    params: dict[str, Any],
-    *,
-    timeout_seconds: float,
-    max_retries: int = 5,
-    base_backoff: float = 2.0,
-) -> requests.Response:
-    last_resp: requests.Response | None = None
-    for attempt in range(max_retries):
-        resp = session.get(url, params=params, timeout=timeout_seconds)
-        last_resp = resp
-        if resp.status_code == 200:
-            return resp
-        if resp.status_code in (429, 503):
-            retry_after = resp.headers.get("Retry-After")
-            try:
-                wait = float(retry_after) if retry_after else base_backoff * (2**attempt)
-            except ValueError:
-                wait = base_backoff * (2**attempt)
-            wait = min(max(wait, base_backoff), 90.0)
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-    if last_resp is not None:
-        last_resp.raise_for_status()
-    raise RuntimeError("Nominatim request failed with no response")
-
-
-def geocode_places_nominatim(
-    place_queries: list[str],
-    project_intel: dict[str, Any],
-    *,
-    delay_seconds: float = 1.1,
-    timeout_seconds: float = 25.0,
-    limit_per_query: int = 1,
-) -> list[dict[str, Any]]:
-    """
-    Resolve placenames to lat/lon via OpenStreetMap Nominatim (~1 request per second).
-    https://nominatim.org/release-docs/develop/api/Search/
-    """
-    if not place_queries:
-        return []
-
-    region_suffix = _nominatim_region_suffix(project_intel)
-    session = requests.Session()
-    ua = os.getenv(
-        "NOMINATIM_USER_AGENT",
-        "digital-city-project-tender-research/1.0 (local pipeline)",
-    ).strip()
-    contact = os.getenv("NOMINATIM_EMAIL", "").strip()
-    if contact and contact not in ua:
-        ua = f"{ua} contact:{contact}"
-    session.headers.update(
-        {
-            "User-Agent": ua,
-            "Accept-Language": "en",
-        }
-    )
-
-    out: list[dict[str, Any]] = []
-    base = "https://nominatim.openstreetmap.org/search"
-    last_request_end = 0.0
-
-    for raw in place_queries:
-        q = (raw or "").strip()
-        if not q:
-            continue
-        q = q[:200]
-        if len(q) < 80 and "india" not in q.lower():
-            search_q = f"{q}{region_suffix}"
-        else:
-            search_q = q
-
-        wait = delay_seconds - (time.monotonic() - last_request_end)
-        if wait > 0:
-            time.sleep(wait)
-
-        try:
-            params: dict[str, Any] = {
-                "q": search_q,
-                "format": "jsonv2",
-                "limit": max(1, limit_per_query),
-                "countrycodes": "in",
+    def _deterministic_fallback() -> dict[str, Any]:
+        tokens = _keyword_tokens()
+        scored: list[tuple[int, dict[str, str]]] = []
+        for page in compact_pages:
+            text = " ".join(
+                [
+                    str(page.get("title") or ""),
+                    str(page.get("snippet") or ""),
+                    str(page.get("query") or ""),
+                    str(page.get("content") or ""),
+                ]
+            ).lower()
+            score = 0
+            for tok in tokens:
+                if tok in text:
+                    score += 1
+            source = {
+                "title": str(page.get("title") or "").strip(),
+                "url": str(page.get("url") or "").strip(),
+                "relevance": "high" if score >= 3 else ("medium" if score >= 1 else "low"),
             }
-            r = _nominatim_get_with_backoff(
-                session,
-                base,
-                params,
-                timeout_seconds=timeout_seconds,
-            )
-            rows = r.json()
-        except Exception as exc:
-            last_request_end = time.monotonic()
-            out.append(
-                {
-                    "query": raw,
-                    "search_query": search_q,
-                    "lat": None,
-                    "lon": None,
-                    "display_name": "",
-                    "error": str(exc),
-                    "map_link": "",
-                    "google_maps": "",
-                    "openstreetmap": "",
-                    "geo_uri": "",
-                }
-            )
-            continue
+            scored.append((score, source))
 
-        last_request_end = time.monotonic()
-        if not isinstance(rows, list) or not rows:
-            out.append(
-                {
-                    "query": raw,
-                    "search_query": search_q,
-                    "lat": None,
-                    "lon": None,
-                    "display_name": "",
-                    "error": "no results",
-                    "map_link": "",
-                    "google_maps": "",
-                    "openstreetmap": "",
-                    "geo_uri": "",
-                }
-            )
-            continue
+        scored.sort(key=lambda item: item[0], reverse=True)
+        picked = [src for score, src in scored if score > 0][:10]
+        if not picked:
+            picked = [{"title": r.title, "url": r.href, "relevance": "low"} for r in results[:10]]
 
-        hit = rows[0]
-        try:
-            lat_f = float(hit["lat"])
-            lon_f = float(hit["lon"])
-        except (KeyError, TypeError, ValueError):
-            out.append(
-                {
-                    "query": raw,
-                    "search_query": search_q,
-                    "lat": None,
-                    "lon": None,
-                    "display_name": str(hit.get("display_name") or ""),
-                    "error": "unparseable coordinates",
-                    "map_link": "",
-                    "google_maps": "",
-                    "openstreetmap": "",
-                    "geo_uri": "",
-                }
-            )
-            continue
-
-        display = str(hit.get("display_name") or "")
-        links = _map_links_for_coordinates(lat_f, lon_f)
-        out.append(
-            {
-                "query": raw,
-                "search_query": search_q,
-                "lat": lat_f,
-                "lon": lon_f,
-                "display_name": display,
-                "importance": hit.get("importance"),
-                "osm_type": hit.get("osm_type"),
-                "osm_id": hit.get("osm_id"),
-                "error": "",
-                **links,
-            }
+        high = sum(1 for s in picked if s["relevance"] == "high")
+        medium = sum(1 for s in picked if s["relevance"] == "medium")
+        summary_text = (
+            f"Relevant tender news summary generated from crawled pages. "
+            f"High relevance sources: {high}, medium relevance sources: {medium}, total cited sources: {len(picked)}."
         )
+        return {
+            "overall_summary": summary_text,
+            "tender_specific_news": "No specific news identified.",
+            "market_and_location_context": "No market context identified.",
+            "sources": picked
+        }
 
-    return out
-
-
-def resolve_geotags(
-    project_intel: dict[str, Any],
-    doc_analysis: dict[str, Any],
-    deepresearch: dict[str, Any],
-    *,
-    skip: bool,
-    max_places: int,
-    delay_seconds: float,
-) -> list[dict[str, Any]]:
-    if skip or max_places <= 0:
-        return []
-    pool = collect_candidate_place_names(
-        project_intel,
-        doc_analysis,
-        deepresearch,
-        max_candidates=max(12, max_places * 4),
-    )
-    return geocode_places_nominatim(pool[:max_places], project_intel, delay_seconds=delay_seconds)
-
-
-def build_markdown_report_context(
-    tender_id: str,
-    project_intel: dict[str, Any],
-    doc_analysis: dict[str, Any],
-    web_summary: dict[str, Any],
-    *,
-    json_synthesis: dict[str, Any] | None = None,
-    geotags: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Single bundle passed into the Markdown writer (optional JSON synthesis when --output full)."""
-    ctx: dict[str, Any] = {
-        "tender_id": tender_id,
-        "project_intel": project_intel,
-        "document_analysis": doc_analysis,
-        "web_summary": web_summary,
-    }
-    if json_synthesis:
-        ctx["json_synthesis"] = json_synthesis
-    if geotags is not None:
-        ctx["geotags"] = geotags
-    return ctx
-
-
-def fallback_markdown_from_artifacts(
-    tender_id: str,
-    project_intel: dict[str, Any],
-    doc_analysis: dict[str, Any],
-    web_summary: dict[str, Any],
-    deepresearch: dict[str, Any],
-    *,
-    reason: str = "",
-    geotags: list[dict[str, Any]] | None = None,
-) -> str:
-    """If the LLM returns nothing, still emit usable Markdown from collected artefacts."""
-    parts: list[str] = [
-        f"# Tender report: {tender_id}",
-        "",
-        "## Project context",
-        "```json",
-        json.dumps(project_intel, indent=2, ensure_ascii=True)[:16000],
-        "```",
-        "",
-        "## Document analysis (raw)",
-        "```json",
-        json.dumps(doc_analysis, indent=2, ensure_ascii=True)[:24000],
-        "```",
-        "",
-        "## Web summary (raw)",
-        "```json",
-        json.dumps(web_summary, indent=2, ensure_ascii=True)[:12000],
-        "```",
-        "",
-        "## DeepResearch ledger (raw)",
-        "```json",
-        json.dumps(deepresearch, indent=2, ensure_ascii=True)[:80000],
-        "```",
-    ]
-    if geotags:
-        parts.extend(
-            [
-                "",
-                "## Geotags (Nominatim)",
-                "```json",
-                json.dumps(geotags, indent=2, ensure_ascii=True)[:24000],
-                "```",
+    raw_response = ""
+    payload: dict[str, Any]
+    try:
+        raw_response = llm.chat(messages, temperature=0.0, max_tokens=2500, num_ctx=32768)
+        payload = _normalize_payload(extract_json_object(raw_response))
+        if _summary_unusable(payload.get("overall_summary", "")):
+            raise ValueError("document 2 summary unusable")
+    except Exception:
+        try:
+            source_candidates = [
+                {"title": str(p.get("title") or ""), "url": str(p.get("url") or "")}
+                for p in compact_pages[:20]
             ]
-        )
-    if reason:
-        parts.insert(1, f"> **Note:** Detailed narrative generation did not return text ({reason}). Below is the raw evidence bundle.\n")
-    return "\n".join(parts)
+            repair_messages = [
+                {"role": "system", "content": "Convert the input into strict JSON. Return JSON only."},
+                {
+                    "role": "user",
+                    "content": (
+                        "Convert this model output to strict JSON with schema:\n"
+                        '{"overall_summary":"", "tender_specific_news":"", "market_and_location_context":"", "sources":[{"title":"","url":"","relevance":"high|medium|low"}]}.\n'
+                        "If information is missing, infer minimally and keep it concise.\n\n"
+                        f"Model output:\n{raw_response[:12000]}\n\n"
+                        f"Source candidates:\n{json.dumps(source_candidates, ensure_ascii=True)}"
+                    ),
+                },
+            ]
+            repaired = llm.chat(repair_messages, temperature=0.0, max_tokens=1000, num_ctx=16384)
+            payload = _normalize_payload(extract_json_object(repaired))
+            if _summary_unusable(payload.get("overall_summary", "")):
+                raise ValueError("document 2 repaired summary unusable")
+        except Exception:
+            payload = _deterministic_fallback()
+
+    if not payload.get("sources"):
+        payload = _deterministic_fallback()
+
+    return payload, results, pages
 
 
-def expand_detailed_report_markdown(
-    llm: OllamaChatClient,
-    *,
+def build_document3(
+    llm: OpenRouterChatClient,
     tender_id: str,
-    project_intel: dict[str, Any],
-    doc_analysis: dict[str, Any],
-    web_summary: dict[str, Any],
-    deepresearch: dict[str, Any],
-    report_context: dict[str, Any],
-    geotags: list[dict[str, Any]],
-    max_tokens: int,
-    num_ctx: int,
-) -> str:
-    """Long-form Markdown report (plain text output, not JSON)."""
-    dr = json.dumps(deepresearch, ensure_ascii=True)
-    if len(dr) > 120_000:
-        dr = dr[:120_000] + "\n... [truncated deepresearch json]\n"
+    document1: dict[str, Any],
+    document2: dict[str, Any],
+    crawler: LocalNewsCrawler,
+    *,
+    search_results_per_query: int,
+    crawl_max_pages: int,
+) -> dict[str, Any]:
+    awarded_entity = _safe_get(document1, ["award_details", "awarded_entity", "value"], "")
+    if not awarded_entity:
+        award_info = document1.get("award_information")
+        if isinstance(award_info, dict):
+            awarded_entity = str(
+                award_info.get("awarded_to")
+                or award_info.get("awarded_entity")
+                or award_info.get("winner")
+                or ""
+            ).strip()
+        elif isinstance(award_info, str):
+            awarded_entity = award_info.strip()
+    if not awarded_entity or awarded_entity.lower() in {"not found", "unclear"}:
+        awarded_entity = "unknown vendor"
 
-    ctx = json.dumps(report_context, ensure_ascii=True)
-    if len(ctx) > 32000:
-        ctx = ctx[:32000] + "\n... [truncated report_context]\n"
+    queries = []
+    try:
+        msgs_d3 = [
+            {"role": "system", "content": "You are an OSINT researcher. Generate a list of precise DuckDuckGo search queries (strings) to find background details about a specific company. Output ONLY a valid JSON array of strings."},
+            {"role": "user", "content": f"Target company/vendor: {awarded_entity}\nGenerate up to 8 queries looking for their GSTIN, CIN, address, scam/blacklist history, and director info. Return JSON array of strings ONLY."}
+        ]
+        resp = llm.chat(msgs_d3, max_tokens=500).strip()
+        if resp.startswith("```json"): resp = resp[7:]
+        if resp.startswith("```"): resp = resp[3:]
+        if resp.endswith("```"): resp = resp[:-3]
+        parsed = json.loads(resp.strip())
+        if isinstance(parsed, list):
+            queries = [str(x) for x in parsed[:10]]
+    except Exception:
+        pass
+
+    if not queries:
+        queries = [
+            f'"{awarded_entity}" GSTIN',
+            f'"{awarded_entity}" CIN',
+            f'"{awarded_entity}" company profile',
+            f'"{awarded_entity}" address',
+            f'"{awarded_entity}" scam OR blacklist'
+        ]
+    results = crawler.search(queries, max_results_per_query=max(6, search_results_per_query // 2))
+    pages = crawler.crawl(results, max_pages=max(1, min(crawl_max_pages, 24)), max_chars=10000)
+    gst_lookup_data = fetch_gst_lookup_data(awarded_entity)
+
+    compact_pages = [
+        {
+            "url": page.get("url", ""),
+            "title": page.get("title", ""),
+            "query": page.get("query", ""),
+            "content": (page.get("content", "") or "")[:2500],
+            "error": page.get("error", ""),
+        }
+        for page in pages
+    ]
+
+    deterministic_text_parts: list[str] = [
+        json.dumps(gst_lookup_data, ensure_ascii=True),
+        " ".join((p.get("content") or "")[:4000] for p in compact_pages[:12]),
+        " ".join((p.get("title") or "") for p in compact_pages[:20]),
+    ]
+    deterministic_identifiers = extract_identifiers_from_text("\n".join(deterministic_text_parts))
 
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You write exhaustive, well-structured tender intelligence reports in Markdown. "
-                "Ground claims in the provided artefacts; quote short evidence snippets; cite file paths or URLs. "
-                "Return ONLY Markdown (no JSON, no preamble)."
-            ),
-        },
+        {"role": "system", "content": "You are a vendor due-diligence assistant. Return JSON only."},
         {
             "role": "user",
             "content": (
-                f"Tender ID: {tender_id}\n\n"
-                "Write a VERY DETAILED Markdown report. Target **at least 4000 words** when the source material "
-                "supports it; if facts are genuinely scarce, still produce a thorough, explicit gap analysis.\n\n"
-                "Use clear `##` / `###` headings and tables where useful.\n\n"
-                "Include these sections in order:\n"
-                "1. Executive overview\n"
-                "2. Project identity (work title, NIT/ref, department, geography)\n"
-                "3. Scope of work & technical description (from internal documents)\n"
-                "4. Procurement process (type, evaluation, fees, validity, key conditions)\n"
-                "5. Timeline & milestones\n"
-                "6. Commercial & financial picture (estimates, bid values if present)\n"
-                "7. Award / outcome & bidders (what is known vs unknown)\n"
-                "8. External landscape (news, portal pages, related announcements) — **relevance-checked** against "
-                "this project, not generic id collisions\n"
-                "9. Risks, red flags, conflicts of interest (if any evidence)\n"
-                "10. Evidence appendix: bullet list mapping major claims → source path or URL\n"
-                "11. **Geography & geotags:** a Markdown table of every resolved place below with columns "
-                "`Place (query)` | `Latitude` | `Longitude` | `Label (Nominatim)` | `Google Maps` | `OSM (hash)` | `geo:`. "
-                "Use the `google_maps` and `openstreetmap` URLs from the geotags JSON; do **not** invent "
-                "`openstreetmap.org/?mlat=` links (they often hit HTTP 429 from Varnish). "
-                "Explain briefly how each location relates to the work site or administration. "
-                "If a row has no coordinates, say why (ambiguous name, geocoder miss).\n\n"
-                f"### Geotags (Nominatim JSON)\n{json.dumps(geotags, ensure_ascii=True)[:12000]}\n\n"
-                f"### Project context\n{json.dumps(project_intel, ensure_ascii=True)[:12000]}\n\n"
-                f"### Collated context (JSON — may include optional json_synthesis)\n{ctx}\n\n"
-                f"### Document analysis (JSON)\n{json.dumps(doc_analysis, ensure_ascii=True)[:24000]}\n\n"
-                f"### Web summary (JSON)\n{json.dumps(web_summary, ensure_ascii=True)[:12000]}\n\n"
-                f"### DeepResearch ledger (JSON)\n{dr}\n"
+                f"Tender ID: {tender_id}\n"
+                f"Target awarded vendor: {awarded_entity}\n"
+                "Create document 3 with vendor details, especially GSTIN and identifiers.\n"
+                "Return JSON schema only:\n"
+                "{"
+                "\"vendor_name\":\"\","
+                "\"identifiers\":{\"gstin\":[],\"cin\":[],\"pan\":[]},"
+                "\"business_profile\":{\"registered_name\":\"\",\"status\":\"\",\"addresses\":[],\"directors_or_proprietor\":[]},"
+                "\"risk_flags\":[],"
+                "\"source_map\":[{\"field\":\"\",\"value\":\"\",\"source\":\"\"}],"
+                "\"confidence\":0.0"
+                "}\n\n"
+                f"Document 1:\n{json.dumps(document1, ensure_ascii=True)[:18000]}\n\n"
+                f"Document 2:\n{json.dumps(document2, ensure_ascii=True)[:18000]}\n\n"
+                f"GST lookup parsed data for awarded entity:\n{json.dumps(gst_lookup_data, ensure_ascii=True)[:18000]}\n\n"
+                f"Crawled vendor pages:\n{json.dumps(compact_pages, ensure_ascii=True)[:100000]}"
             ),
         },
     ]
-    return llm.chat(messages, temperature=0.0, max_tokens=max_tokens, num_ctx=num_ctx).strip()
 
+    try:
+        payload = extract_json_object(llm.chat(messages, temperature=0.0, max_tokens=2200, num_ctx=32768))
+        if not isinstance(payload, dict):
+            raise ValueError("document 3 returned non-object JSON")
+    except Exception as exc:
+        payload = {
+            "vendor_name": awarded_entity,
+            "identifiers": {"gstin": [], "cin": [], "pan": []},
+            "business_profile": {"registered_name": "", "status": "", "addresses": [], "directors_or_proprietor": []},
+            "risk_flags": [f"Document 3 generation failed: {exc}"],
+            "source_map": [],
+            "confidence": 0.0,
+        }
 
-def build_html_report(
-    tender_id: str,
-    final_summary: dict[str, Any],
-    doc_analysis: dict[str, Any],
-    web_summary: dict[str, Any],
-    web_pages: list[dict[str, str]],
-    deepresearch: dict[str, Any],
-    issues: list[ExtractionIssue],
-    *,
-    report_markdown: str = "",
-) -> str:
-    key_points = final_summary.get("key_points") or []
-    timeline = final_summary.get("timeline") or []
-    news = web_summary.get("relevant_news") or []
-    risks = final_summary.get("risks") or web_summary.get("risks") or []
-
-    def li(items: list[str]) -> str:
-        return "".join(f"<li>{pyhtml.escape(str(item))}</li>" for item in items)
-
-    timeline_rows = "".join(
-        (
-            "<tr>"
-            f"<td>{pyhtml.escape(str(item.get('event', '')))}</td>"
-            f"<td>{pyhtml.escape(str(item.get('date', '')))}</td>"
-            "</tr>"
-        )
-        for item in timeline
-        if isinstance(item, dict)
+    payload.setdefault("vendor_name", awarded_entity)
+    merged_identifiers = merge_identifier_map(
+        payload.get("identifiers") if isinstance(payload.get("identifiers"), dict) else {},
+        deterministic_identifiers,
     )
+    payload["identifiers"] = merged_identifiers
 
-    news_cards = "".join(
-        (
-            "<article class='card'>"
-            f"<h4>{pyhtml.escape(str(item.get('title', 'Untitled')))}</h4>"
-            f"<p>{pyhtml.escape(str(item.get('summary', '')))}</p>"
-            f"<p><a href='{pyhtml.escape(str(item.get('url', '#')))}' target='_blank' rel='noopener'>"
-            f"{pyhtml.escape(str(item.get('url', '')))}</a></p>"
-            "</article>"
-        )
-        for item in news
-        if isinstance(item, dict)
-    )
+    payload.setdefault("business_profile", {})
+    if isinstance(payload.get("business_profile"), dict):
+        payload["business_profile"].setdefault("registered_name", awarded_entity)
+        if not str(payload["business_profile"].get("registered_name") or "").strip():
+            payload["business_profile"]["registered_name"] = awarded_entity
 
-    issue_rows = "".join(
-        (
-            "<tr>"
-            f"<td>{pyhtml.escape(issue.file)}</td>"
-            f"<td>{pyhtml.escape(issue.extension)}</td>"
-            f"<td>{pyhtml.escape(issue.reason)}</td>"
-            "</tr>"
-        )
-        for issue in issues
-    )
+    payload.setdefault("source_map", [])
+    if isinstance(payload.get("source_map"), list):
+        if merged_identifiers.get("gstin"):
+            for gstin in merged_identifiers["gstin"]:
+                payload["source_map"].append({"field": "identifiers.gstin", "value": gstin, "source": "gst_lookup_and_crawled_pages"})
+        if merged_identifiers.get("cin"):
+            for cin in merged_identifiers["cin"]:
+                payload["source_map"].append({"field": "identifiers.cin", "value": cin, "source": "gst_lookup_and_crawled_pages"})
+        if merged_identifiers.get("pan"):
+            for pan in merged_identifiers["pan"]:
+                payload["source_map"].append({"field": "identifiers.pan", "value": pan, "source": "gst_lookup_and_crawled_pages"})
 
-    crawled_rows = "".join(
-        (
-            "<tr>"
-            f"<td><a href='{pyhtml.escape(str(page.get('url', '#')))}' target='_blank' rel='noopener'>"
-            f"{pyhtml.escape(str(page.get('title', page.get('url', ''))))}</a></td>"
-            f"<td>{pyhtml.escape(str(page.get('query', '')))}</td>"
-            f"<td>{pyhtml.escape(str(page.get('error', '')))}</td>"
-            "</tr>"
-        )
-        for page in web_pages
-    )
+    if not isinstance(payload.get("confidence"), (int, float)):
+        payload["confidence"] = 0.0
+    if any(payload["identifiers"].get(k) for k in ("gstin", "cin", "pan")):
+        payload["confidence"] = max(float(payload.get("confidence") or 0.0), 0.55)
 
-    return f"""<!doctype html>
-<html lang='en'>
-<head>
-<meta charset='utf-8'>
-<meta name='viewport' content='width=device-width, initial-scale=1'>
-<title>Tender Report {pyhtml.escape(tender_id)}</title>
-<style>
-  :root {{ --bg:#f5f2ea; --ink:#1f2937; --accent:#0f766e; --muted:#6b7280; --card:#ffffff; --line:#d1d5db; }}
-  body {{ margin:0; font-family: 'Georgia', 'Times New Roman', serif; background: radial-gradient(circle at top right, #e8f6f3, var(--bg)); color:var(--ink); }}
-  .wrap {{ max-width: 1100px; margin: 0 auto; padding: 24px; }}
-  h1,h2,h3,h4 {{ margin: 0 0 12px; }}
-  h1 {{ font-size: 2rem; color: var(--accent); }}
-  .grid {{ display:grid; gap:16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }}
-  .card {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; box-shadow:0 6px 18px rgba(0,0,0,0.05); }}
-  .meta {{ color:var(--muted); margin-bottom:12px; }}
-  ul {{ margin:0; padding-left:20px; }}
-  table {{ width:100%; border-collapse: collapse; background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden; }}
-  th, td {{ border-bottom:1px solid var(--line); padding:10px; text-align:left; vertical-align:top; }}
-  th {{ background:#ecfeff; }}
-  a {{ color:#0c4a6e; }}
-  .section {{ margin-top: 20px; }}
-  pre {{ white-space: pre-wrap; background:#111827; color:#e5e7eb; padding:12px; border-radius:8px; overflow:auto; }}
-</style>
-</head>
-<body>
-  <main class='wrap'>
-    <h1>Tender Intelligence Report</h1>
-    <p class='meta'>Tender ID: <strong>{pyhtml.escape(tender_id)}</strong> | Generated at: {pyhtml.escape(time.strftime('%Y-%m-%d %H:%M:%S'))}</p>
-
-    <section class='grid'>
-      <article class='card'>
-        <h2>Executive Summary</h2>
-        <p>{pyhtml.escape(str(final_summary.get('executive_summary', '')))}</p>
-      </article>
-      <article class='card'>
-        <h2>Award Snapshot</h2>
-        <p><strong>Status:</strong> {pyhtml.escape(str(final_summary.get('status', 'unknown')))}</p>
-        <p><strong>Awarded By:</strong> {pyhtml.escape(str(final_summary.get('awarded_by', '')))}</p>
-        <p><strong>Awarded To:</strong> {pyhtml.escape(str(final_summary.get('awarded_to', '')))}</p>
-        <p><strong>Confidence:</strong> {pyhtml.escape(str(final_summary.get('confidence', 0.0)))}</p>
-      </article>
-    </section>
-
-    <section class='section card'>
-      <h2>Key Points</h2>
-      <ul>{li([str(x) for x in key_points])}</ul>
-    </section>
-
-    <section class='section card'>
-      <h2>Timeline</h2>
-      <table>
-        <thead><tr><th>Event</th><th>Date</th></tr></thead>
-        <tbody>{timeline_rows}</tbody>
-      </table>
-    </section>
-
-    <section class='section'>
-      <h2>News & Web Signals</h2>
-      <div class='grid'>{news_cards}</div>
-    </section>
-
-    <section class='section card'>
-      <h2>Risks</h2>
-      <ul>{li([str(x) for x in risks])}</ul>
-    </section>
-
-    <section class='section card'>
-      <h2>Crawled Sources</h2>
-      <table>
-        <thead><tr><th>Source</th><th>Query</th><th>Error</th></tr></thead>
-        <tbody>{crawled_rows}</tbody>
-      </table>
-    </section>
-
-    <section class='section card'>
-      <h2>Extraction Issues</h2>
-      <table>
-        <thead><tr><th>File</th><th>Ext</th><th>Issue</th></tr></thead>
-        <tbody>{issue_rows}</tbody>
-      </table>
-    </section>
-
-    <section class='section card'>
-      <h2>Raw Objects</h2>
-      <h3>DeepResearch</h3>
-      <pre>{pyhtml.escape(json.dumps(deepresearch, indent=2, ensure_ascii=True)[:240000])}</pre>
-      <h3>Document Analysis</h3>
-      <pre>{pyhtml.escape(json.dumps(doc_analysis, indent=2, ensure_ascii=True))}</pre>
-      <h3>Web Summary</h3>
-      <pre>{pyhtml.escape(json.dumps(web_summary, indent=2, ensure_ascii=True))}</pre>
-    </section>
-
-    <section class='section card'>
-      <h2>Detailed Report (Markdown)</h2>
-      <pre>{pyhtml.escape(str(report_markdown or ''))}</pre>
-    </section>
-  </main>
-</body>
-</html>
-"""
+    return payload
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Agentic tender pipeline: collect data, research, and write a detailed Markdown report "
-            "(default). Use --output full for JSON + HTML + Markdown."
+            "Agentic tender pipeline: read source_dir/<tender_id>, research, and write a detailed report."
         )
     )
     parser.add_argument("--tender-id", required=True, help="6-digit tender ID")
-    parser.add_argument("--downloads-root", default="downloads/agentic_reports")
-    parser.add_argument("--output-root", default="outputs/tender_reports")
-    parser.add_argument(
-        "--output",
-        choices=("markdown", "full"),
-        default="markdown",
-        help="markdown = only {id}_report.md; full = also JSON + HTML.",
-    )
-    parser.add_argument("--ollama-base-url", default=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
-    parser.add_argument("--ollama-model", default=os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud"))
-    parser.add_argument("--rate-limit-seconds", type=float, default=2.0)
-    parser.add_argument("--llm-timeout-seconds", type=float, default=600.0)
-    parser.add_argument("--llm-num-ctx", type=int, default=65536, help="Ollama num_ctx for large prompts.")
-    parser.add_argument("--max-doc-files", type=int, default=200)
-    parser.add_argument("--max-doc-chars", type=int, default=12000)
-    parser.add_argument(
-        "--search-results-per-query",
-        type=int,
-        default=14,
-        help="More hits per query → more unique URLs available to crawl.",
-    )
-    parser.add_argument(
-        "--crawl-max-pages",
-        type=int,
-        default=36,
-        help="Max HTML pages to fetch from the initial search-result set.",
-    )
-    parser.add_argument(
-        "--crawl-max-chars",
-        type=int,
-        default=16000,
-        help="Max characters of visible text retained per crawled page.",
-    )
-    parser.add_argument("--crawl-workers", type=int, default=8)
-    parser.add_argument(
-        "--max-web-queries",
-        type=int,
-        default=42,
-        help="Cap on distinct web search strings (project-centric queries first).",
-    )
-    parser.add_argument(
-        "--synthesis-max-tokens",
-        type=int,
-        default=6000,
-        help="num_predict for structured JSON synthesis.",
-    )
-    parser.add_argument(
-        "--report-expand-tokens",
-        type=int,
-        default=12000,
-        help="num_predict for long-form Markdown expansion pass.",
-    )
-    parser.add_argument(
-        "--deepresearch-rounds",
-        type=int,
-        default=4,
-        help="How many ReAct research loops to run (web + files) before final write-up.",
-    )
-    parser.add_argument(
-        "--deepresearch-max-pages",
-        type=int,
-        default=48,
-        help="Max pages to crawl during deepresearch (per direct-URL crawl batch).",
-    )
-    parser.add_argument(
-        "--max-geocode-places",
-        type=int,
-        default=18,
-        help="Max distinct placenames to send to Nominatim (0 disables).",
-    )
-    parser.add_argument(
-        "--geocode-delay-seconds",
-        type=float,
-        default=1.25,
-        help="Pause between Nominatim requests (policy: ~1 req/sec; higher reduces HTTP 429).",
-    )
-    parser.add_argument(
-        "--skip-geocode",
-        action="store_true",
-        help="Do not call OpenStreetMap Nominatim (offline / faster).",
-    )
     return parser
-
-
-def deepresearch_react(
-    llm: OllamaChatClient,
-    *,
-    tender_id: str,
-    project_intel: dict[str, Any],
-    portal_data: dict[str, Any],
-    docs: list[dict[str, str]],
-    initial_queries: list[str],
-    baseline_pages: list[dict[str, str]],
-    rounds: int,
-    crawler: LocalNewsCrawler,
-    search_results_per_query: int,
-    max_pages: int,
-) -> dict[str, Any]:
-    """
-    LangChain-style ReAct orchestration (implemented locally to avoid a brittle
-    dependency chain) that alternates between:
-      - web_search(query)
-      - crawl(urls)
-      - read_file(path)
-      - search_files(term)
-    and accumulates an evidence ledger.
-    """
-
-    def tool_web_search(query: str) -> list[dict[str, str]]:
-        results = crawler.search([query], max_results_per_query=search_results_per_query)
-        return [asdict(r) for r in results]
-
-    def tool_web_crawl(urls: list[str]) -> list[dict[str, str]]:
-        items = [SearchResult(title=u, href=u, snippet="", source_query="direct_url") for u in urls if u]
-        return crawler.crawl(items, max_pages=min(len(items), max_pages))
-
-    def tool_file_manifest() -> list[dict[str, Any]]:
-        return [{"path": d["path"], "chars": len(d.get("text") or "")} for d in docs]
-
-    def tool_read_file(path: str) -> dict[str, str]:
-        for d in docs:
-            if d.get("path") == path:
-                return {"path": path, "text": (d.get("text") or "")[:12000]}
-        return {"path": path, "text": ""}
-
-    def tool_search_files(term: str) -> list[dict[str, str]]:
-        if not term:
-            return []
-        needle = term.lower()
-        hits: list[dict[str, str]] = []
-        for d in docs:
-            text = (d.get("text") or "")
-            if needle in text.lower():
-                idx = text.lower().find(needle)
-                start = max(0, idx - 400)
-                end = min(len(text), idx + 1200)
-                hits.append({"path": d.get("path", ""), "snippet": text[start:end]})
-        return hits[:25]
-
-    ledger: dict[str, Any] = {
-        "tender_id": tender_id,
-        "project_intel": project_intel,
-        "rounds": rounds,
-        "research_notes": [],
-        "web_pages": list(baseline_pages),
-        "queries_run": list(initial_queries),
-        "files_manifest": tool_file_manifest(),
-        "evidence": {
-            "file_quotes": [],
-            "web_quotes": [],
-            "entities": {"people": [], "orgs": [], "locations": [], "products": [], "ids": []},
-            "dates": [],
-            "money": [],
-            "claims": [],
-        },
-    }
-
-    system = (
-        "You are DeepResearch, an investigative tender research agent. "
-        "You must uncover everything relevant about this tender, prioritising:\n"
-        "- news, updates, corrigenda, award status, litigation/complaints\n"
-        "- contracting authority, vendors, contract value, scope, milestones\n"
-        "- evaluation criteria, eligibility, risks, red flags, conflicts\n"
-        "Search the WEB using the **project/work identity** (title, department, NIT/ref, geography). "
-        "Do **not** issue queries that are only the 6-digit portal tender id — combine the id with "
-        "department / work title / place names when needed.\n"
-        "You can use tools. When you need evidence, call tools instead of guessing.\n"
-        "Return STRICT JSON only."
-    )
-
-    def ask_for_plan(existing_notes: list[str]) -> dict[str, Any]:
-        messages = [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": (
-                    f"Tender ID: {tender_id}\n"
-                    f"Project / work context (use for web_search queries):\n"
-                    f"{json.dumps(project_intel, ensure_ascii=True)[:12000]}\n\n"
-                    "You have the following tools available:\n"
-                    "- web_search(query) -> list of {title,href,snippet,source_query}\n"
-                    "- web_crawl(urls[]) -> list of {url,title,query,snippet,content,error}\n"
-                    "- file_manifest() -> list of {path,chars}\n"
-                    "- read_file(path) -> {path,text}\n"
-                    "- search_files(term) -> list of {path,snippet}\n\n"
-                    "Create a ReAct research step for THIS round. "
-                    "Decide what to search next, which files to inspect, and what to extract.\n"
-                    "Return JSON:\n"
-                    "{"
-                    '"thoughts":"brief",'
-                    '"web_queries":["..."],'
-                    '"urls_to_crawl":["..."],'
-                    '"file_paths_to_read":["..."],'
-                    '"file_terms_to_search":["..."],'
-                    '"extraction_targets":["specific facts to extract"]'
-                    "}\n\n"
-                    f"Portal data (compact): {json.dumps(portal_data, ensure_ascii=True)[:14000]}\n\n"
-                    f"Existing notes: {json.dumps(existing_notes, ensure_ascii=True)[:8000]}\n"
-                ),
-            },
-        ]
-        raw = llm.chat(messages, temperature=0.0, max_tokens=1400)
-        return extract_json_object(raw)
-
-    def ask_for_extraction(
-        *,
-        round_idx: int,
-        plan: dict[str, Any],
-        file_reads: list[dict[str, str]],
-        file_hits: list[dict[str, str]],
-        web_results: list[dict[str, Any]],
-        crawled_pages: list[dict[str, str]],
-    ) -> dict[str, Any]:
-        messages = [
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": (
-                    f"Tender ID: {tender_id}\nRound: {round_idx}\n"
-                    f"Project / work context:\n{json.dumps(project_intel, ensure_ascii=True)[:8000]}\n\n"
-                    "Extract VERIFIED facts only, each with at least one quote and a source.\n"
-                    "Return JSON:\n"
-                    "{"
-                    '"notes":["..."],'
-                    '"file_quotes":[{"path":"...","quote":"...","why":"..."}],'
-                    '"web_quotes":[{"url":"...","quote":"...","why":"..."}],'
-                    '"entities":{"people":["..."],"orgs":["..."],"locations":["..."],"products":["..."],"ids":["..."]},'
-                    '"dates":[{"date":"...","context":"...","source":"file|web","ref":"path-or-url"}],'
-                    '"money":[{"amount":"...","context":"...","source":"file|web","ref":"path-or-url"}],'
-                    '"claims":[{"claim":"...","supporting_refs":["..."],"confidence":"high|medium|low"}],'
-                    '"next_queries":["..."]'
-                    "}\n\n"
-                    f"Plan: {json.dumps(plan, ensure_ascii=True)[:8000]}\n\n"
-                    f"Web search results: {json.dumps(web_results, ensure_ascii=True)[:12000]}\n\n"
-                    f"Crawled pages: {json.dumps(crawled_pages, ensure_ascii=True)[:18000]}\n\n"
-                    f"File term hits: {json.dumps(file_hits, ensure_ascii=True)[:12000]}\n\n"
-                    f"File reads: {json.dumps(file_reads, ensure_ascii=True)[:18000]}\n"
-                ),
-            },
-        ]
-        raw = llm.chat(messages, temperature=0.0, max_tokens=2200)
-        return extract_json_object(raw)
-
-    notes: list[str] = []
-    for r in range(1, max(1, rounds) + 1):
-        plan = ask_for_plan(notes)
-
-        web_queries = [str(q) for q in (plan.get("web_queries") or []) if isinstance(q, str) and q.strip()]
-        urls_to_crawl = [str(u) for u in (plan.get("urls_to_crawl") or []) if isinstance(u, str) and u.strip()]
-        file_paths_to_read = [str(p) for p in (plan.get("file_paths_to_read") or []) if isinstance(p, str) and p.strip()]
-        file_terms_to_search = [str(t) for t in (plan.get("file_terms_to_search") or []) if isinstance(t, str) and t.strip()]
-
-        web_results: list[dict[str, Any]] = []
-        for q in web_queries[:10]:
-            ledger["queries_run"].append(q)
-            web_results.extend(tool_web_search(q))
-
-        crawled = tool_web_crawl(urls_to_crawl[: max_pages])
-        if crawled:
-            ledger["web_pages"].extend(crawled)
-
-        file_reads = [tool_read_file(p) for p in file_paths_to_read[:14]]
-        file_hits: list[dict[str, str]] = []
-        for term in file_terms_to_search[:10]:
-            file_hits.extend(tool_search_files(term))
-
-        extracted = ask_for_extraction(
-            round_idx=r,
-            plan=plan,
-            file_reads=file_reads,
-            file_hits=file_hits,
-            web_results=web_results,
-            crawled_pages=crawled,
-        )
-
-        new_notes = [str(x) for x in (extracted.get("notes") or []) if isinstance(x, str) and x.strip()]
-        notes.extend(new_notes)
-        ledger["research_notes"].extend(new_notes)
-
-        for key in ("file_quotes", "web_quotes"):
-            items = extracted.get(key) or []
-            if isinstance(items, list):
-                ledger["evidence"][key].extend([x for x in items if isinstance(x, dict)])
-
-        ent = extracted.get("entities") or {}
-        if isinstance(ent, dict):
-            for k in ("people", "orgs", "locations", "products", "ids"):
-                vals = ent.get(k) or []
-                if isinstance(vals, list):
-                    ledger["evidence"]["entities"][k].extend([str(v) for v in vals if isinstance(v, str) and v.strip()])
-
-        for key in ("dates", "money", "claims"):
-            items = extracted.get(key) or []
-            if isinstance(items, list):
-                ledger["evidence"][key].extend([x for x in items if isinstance(x, dict)])
-
-        next_queries = [str(q) for q in (extracted.get("next_queries") or []) if isinstance(q, str) and q.strip()]
-        # Seed the next round with new queries by appending to the note list.
-        if next_queries:
-            notes.append("Next round query ideas: " + "; ".join(next_queries[:10]))
-
-    # Deduplicate entity lists
-    for k in ("people", "orgs", "locations", "products", "ids"):
-        seen: set[str] = set()
-        uniq: list[str] = []
-        for v in ledger["evidence"]["entities"][k]:
-            vv = v.strip()
-            if vv and vv not in seen:
-                seen.add(vv)
-                uniq.append(vv)
-        ledger["evidence"]["entities"][k] = uniq
-
-    return ledger
-
-
-def deepresearch_langchain_react(
-    *,
-    ollama_base_url: str,
-    ollama_model: str,
-    tender_id: str,
-    project_intel: dict[str, Any],
-    portal_data: dict[str, Any],
-    docs: list[dict[str, str]],
-    initial_queries: list[str],
-    baseline_pages: list[dict[str, str]],
-    rounds: int,
-    crawler: LocalNewsCrawler,
-    search_results_per_query: int,
-    max_pages: int,
-) -> dict[str, Any]:
-    """
-    Preferred implementation: LangChain ReAct agent with Ollama LLM.
-    If LangChain isn't available at runtime, callers should fall back to `deepresearch_react`.
-    """
-    from langchain.agents import AgentExecutor, create_react_agent  # type: ignore
-    from langchain_core.prompts import PromptTemplate  # type: ignore
-    from langchain_core.tools import tool  # type: ignore
-    from langchain_ollama import ChatOllama  # type: ignore
-
-    llm = ChatOllama(model=ollama_model, base_url=ollama_base_url.rstrip("/"), temperature=0.0)
-
-    @tool
-    def web_search(query: str) -> str:
-        "Search the web for relevant pages; returns JSON list of results."
-        results = crawler.search([query], max_results_per_query=search_results_per_query)
-        return json.dumps([asdict(r) for r in results], ensure_ascii=True)
-
-    @tool
-    def web_crawl(urls_json: str) -> str:
-        "Crawl the given URLs (JSON list of strings) and return JSON list of page objects."
-        try:
-            urls = json.loads(urls_json)
-        except Exception:
-            urls = []
-        if not isinstance(urls, list):
-            urls = []
-        items = [
-            SearchResult(title=str(u), href=str(u), snippet="", source_query="direct_url")
-            for u in urls
-            if isinstance(u, str) and u.strip()
-        ]
-        pages = crawler.crawl(items, max_pages=min(len(items), max_pages))
-        return json.dumps(pages, ensure_ascii=True)
-
-    @tool
-    def file_manifest(_: str = "") -> str:
-        "Return JSON list of all available file paths and char counts."
-        manifest = [{"path": d["path"], "chars": len(d.get("text") or "")} for d in docs]
-        return json.dumps(manifest, ensure_ascii=True)
-
-    @tool
-    def read_file(path: str) -> str:
-        "Read a file by exact path from the tender corpus and return JSON {path,text}."
-        for d in docs:
-            if d.get("path") == path:
-                payload = {"path": path, "text": (d.get("text") or "")[:12000]}
-                return json.dumps(payload, ensure_ascii=True)
-        return json.dumps({"path": path, "text": ""}, ensure_ascii=True)
-
-    @tool
-    def search_files(term: str) -> str:
-        "Search across file texts for a term; return JSON list of {path,snippet}."
-        term = (term or "").strip()
-        if not term:
-            return "[]"
-        needle = term.lower()
-        hits: list[dict[str, str]] = []
-        for d in docs:
-            text = (d.get("text") or "")
-            lower = text.lower()
-            if needle in lower:
-                idx = lower.find(needle)
-                start = max(0, idx - 400)
-                end = min(len(text), idx + 1200)
-                hits.append({"path": d.get("path", ""), "snippet": text[start:end]})
-        return json.dumps(hits[:25], ensure_ascii=True)
-
-    tools = [web_search, web_crawl, file_manifest, read_file, search_files]
-
-    prompt = PromptTemplate.from_template(
-        "You are DeepResearch, an investigative tender research agent.\n"
-        "Your job: find everything possible about the tender, focusing on news, updates, award status, "
-        "corrigenda, vendors, contract value, scope, evaluation, timelines, risks.\n"
-        "Use web_search with **project/work details** (title, department, NIT/ref, geography). "
-        "Avoid queries that are ONLY the 6-digit portal tender id.\n"
-        "You MUST use tools to gather evidence, and you MUST cite sources in your final JSON.\n\n"
-        "Tender ID: {tender_id}\n"
-        "Project / work context: {project_intel}\n"
-        "Portal data (compact): {portal_data}\n"
-        "Initial queries: {initial_queries}\n\n"
-        "Use the following format:\n\n"
-        "Question: the question you must answer\n"
-        "Thought: you should always think about what to do\n"
-        "Action: the action to take, should be one of [{tool_names}]\n"
-        "Action Input: the input to the action\n"
-        "Observation: the result of the action\n"
-        "... (repeat Thought/Action/Action Input/Observation as needed)\n"
-        "Final Answer: return STRICT JSON with keys:\n"
-        "{"
-        "\"tender_id\":\"...\","
-        "\"research_notes\":[\"...\"],"
-        "\"queries_run\":[\"...\"],"
-        "\"web_pages\":[{\"url\":\"...\",\"title\":\"...\",\"query\":\"...\",\"snippet\":\"...\",\"content\":\"...\",\"error\":\"...\"}],"
-        "\"evidence\":{"
-        "\"file_quotes\":[{\"path\":\"...\",\"quote\":\"...\",\"why\":\"...\"}],"
-        "\"web_quotes\":[{\"url\":\"...\",\"quote\":\"...\",\"why\":\"...\"}],"
-        "\"entities\":{\"people\":[],\"orgs\":[],\"locations\":[],\"products\":[],\"ids\":[]},"
-        "\"dates\":[],\"money\":[],\"claims\":[]"
-        "}"
-        "}\n\n"
-        "Begin.\n"
-        "Question: Build an exhaustive evidence ledger for this tender.\n"
-        "{agent_scratchpad}"
-    )
-
-    agent = create_react_agent(llm, tools, prompt)
-    executor = AgentExecutor(agent=agent, tools=tools, verbose=False, handle_parsing_errors=True, max_iterations=max(6, rounds * 4))
-
-    result = executor.invoke(
-        {
-            "tender_id": tender_id,
-            "project_intel": json.dumps(project_intel, ensure_ascii=True)[:12000],
-            "portal_data": json.dumps(portal_data, ensure_ascii=True)[:14000],
-            "initial_queries": json.dumps(initial_queries, ensure_ascii=True)[:4000],
-        }
-    )
-    output_text = result.get("output", "") if isinstance(result, dict) else str(result)
-    payload = extract_json_object(output_text)
-    if not isinstance(payload, dict):
-        raise ValueError("LangChain ReAct returned non-object JSON")
-
-    # merge baseline pages (so we preserve the earlier crawl)
-    pages = payload.get("web_pages")
-    if isinstance(pages, list):
-        merged = list(baseline_pages) + [p for p in pages if isinstance(p, dict)]
-        payload["web_pages"] = merged
-    else:
-        payload["web_pages"] = list(baseline_pages)
-
-    # guarantee a couple of expected keys
-    payload.setdefault("tender_id", tender_id)
-    payload.setdefault("queries_run", list(initial_queries))
-    payload.setdefault("project_intel", project_intel)
-    return payload
 
 
 def main() -> int:
@@ -2080,223 +1364,94 @@ def main() -> int:
         print("tender-id must be exactly 6 digits")
         return 2
 
-    downloads_root = Path(args.downloads_root).resolve()
-    output_root = Path(args.output_root).resolve()
+    source_root = (Path("downloads") / tender_id).resolve()
+    output_root = Path("outputs/tender_reports").resolve()
+    openrouter_base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    openrouter_model = os.getenv("OPENROUTER_MODEL", "tencent/hy3-preview:free")
+    llm_timeout_seconds = 600.0
+    max_doc_files = 200
+    max_doc_chars = 12000
+    search_results_per_query = 14
+    crawl_max_pages = 36
+    crawl_max_chars = 16000
+    crawl_workers = 8
+
     tender_output_dir = output_root / tender_id
     tender_output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[1/6] Collecting tender data for {tender_id}")
-    collected = collect_tender_data(tender_id, downloads_root, args.rate_limit_seconds)
+    print(f"[1/6] Loading tender data from {source_root}")
+    try:
+        collected = build_local_source_collection(source_root)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        print(str(exc))
+        return 2
 
     source_dirs = [Path(p) for p in collected["source_dirs"]]
     print(f"[2/6] Reading documents from {len(source_dirs)} source directories")
-    reader = DocumentReader(max_files=args.max_doc_files, max_chars_per_file=args.max_doc_chars)
+    reader = DocumentReader(max_files=max_doc_files, max_chars_per_file=max_doc_chars)
     docs, issues = reader.read_documents(source_dirs)
     print(f"      Readable docs: {len(docs)} | Issues: {len(issues)}")
 
-    llm = OllamaChatClient(
-        base_url=args.ollama_base_url,
-        model=args.ollama_model,
-        timeout_seconds=args.llm_timeout_seconds,
+    llm = OpenRouterChatClient(
+        base_url=openrouter_base_url,
+        model=openrouter_model,
+        timeout_seconds=llm_timeout_seconds,
     )
+    crawler = LocalNewsCrawler(max_workers=crawl_workers)
 
-    print("[3/6] Analyzing tender documents with LLM")
-    doc_analysis = analyze_documents(llm, tender_id, docs, collected["portal_data"])
-    project_intel = merge_project_intel(doc_analysis)
+    print("[3/5] Step 1: Extracting structured tender facts (document 1)")
+    document1 = analyze_documents(llm, tender_id, docs, collected["portal_data"])
+    doc1_path = tender_output_dir / f"{tender_id}_document_1.json"
+    write_json(doc1_path, document1)
+    print(f"Document 1: {doc1_path}")
 
-    queries = build_web_queries(
-        tender_id,
-        doc_analysis,
-        project_intel=project_intel,
-        max_queries=max(12, args.max_web_queries),
-    )
-    print(f"[4/6] Web research with local crawler. Queries ({len(queries)}): {queries[:8]}{' ...' if len(queries) > 8 else ''}")
-    crawler = LocalNewsCrawler(max_workers=args.crawl_workers)
-    search_results = crawler.search(queries, max_results_per_query=args.search_results_per_query)
-    crawled_pages = crawler.crawl(
-        search_results,
-        max_pages=max(1, args.crawl_max_pages),
-        max_chars=max(2000, args.crawl_max_chars),
-    )
-    print(f"      Search results: {len(search_results)} | Crawled pages: {len(crawled_pages)}")
-
-    print("[5/6] DeepResearch (ReAct loop) + Markdown report")
-    deepresearch: dict[str, Any]
-    try:
-        deepresearch = deepresearch_langchain_react(
-            ollama_base_url=args.ollama_base_url,
-            ollama_model=args.ollama_model,
-            tender_id=tender_id,
-            project_intel=project_intel,
-            portal_data=collected["portal_data"],
-            docs=docs,
-            initial_queries=queries,
-            baseline_pages=crawled_pages,
-            rounds=args.deepresearch_rounds,
-            crawler=crawler,
-            search_results_per_query=args.search_results_per_query,
-            max_pages=args.deepresearch_max_pages,
-        )
-    except Exception:
-        deepresearch = deepresearch_react(
-            llm,
-            tender_id=tender_id,
-            project_intel=project_intel,
-            portal_data=collected["portal_data"],
-            docs=docs,
-            initial_queries=queries,
-            baseline_pages=crawled_pages,
-            rounds=args.deepresearch_rounds,
-            crawler=crawler,
-            search_results_per_query=args.search_results_per_query,
-            max_pages=args.deepresearch_max_pages,
-        )
-
-    web_summary = summarize_web_findings(
+    print("[4/5] Step 2: Building search strings, crawling, and summarizing (document 2)")
+    document2, step2_results, step2_pages = build_document2(
         llm,
         tender_id,
-        deepresearch.get("web_pages") or crawled_pages,
-        project_intel=project_intel,
+        document1,
+        crawler,
+        search_results_per_query=search_results_per_query,
+        crawl_max_pages=crawl_max_pages,
+        crawl_max_chars=crawl_max_chars,
     )
+    doc2_path = tender_output_dir / f"{tender_id}_document_2.json"
+    write_json(doc2_path, document2)
+    print(f"Document 2: {doc2_path} | Search results: {len(step2_results)} | Crawled pages: {len(step2_pages)}")
 
-    geotags = resolve_geotags(
-        project_intel,
-        doc_analysis,
-        deepresearch,
-        skip=args.skip_geocode,
-        max_places=max(0, args.max_geocode_places),
-        delay_seconds=max(0.5, args.geocode_delay_seconds),
-    )
-    print(f"      Geotags resolved: {sum(1 for g in geotags if g.get('lat') is not None)}/{len(geotags)}")
-
-    json_synthesis: dict[str, Any] | None = None
-    if args.output == "full":
-        json_synthesis = synthesize_final_report(
-            llm,
-            tender_id,
-            doc_analysis,
-            web_summary,
-            deepresearch,
-            project_intel=project_intel,
-            max_tokens=max(1024, args.synthesis_max_tokens),
-            num_ctx=max(8192, args.llm_num_ctx),
-        )
-
-    report_context = build_markdown_report_context(
+    print("[5/5] Step 3: Vendor enrichment (GSTIN and identifiers) (document 3)")
+    document3 = build_document3(
+        llm,
         tender_id,
-        project_intel,
-        doc_analysis,
-        web_summary,
-        json_synthesis=json_synthesis,
-        geotags=geotags,
+        document1,
+        document2,
+        crawler,
+        search_results_per_query=search_results_per_query,
+        crawl_max_pages=crawl_max_pages,
     )
+    doc3_path = tender_output_dir / f"{tender_id}_document_3.json"
+    write_json(doc3_path, document3)
+    print(f"Document 3: {doc3_path}")
 
-    md_err = ""
-    try:
-        report_md = expand_detailed_report_markdown(
-            llm,
-            tender_id=tender_id,
-            project_intel=project_intel,
-            doc_analysis=doc_analysis,
-            web_summary=web_summary,
-            deepresearch=deepresearch,
-            report_context=report_context,
-            geotags=geotags,
-            max_tokens=max(2048, args.report_expand_tokens),
-            num_ctx=max(8192, args.llm_num_ctx),
-        )
-    except Exception as exc:
-        md_err = str(exc)
-        report_md = ""
-
-    if not (report_md or "").strip():
-        report_md = fallback_markdown_from_artifacts(
-            tender_id,
-            project_intel,
-            doc_analysis,
-            web_summary,
-            deepresearch,
-            reason=md_err or "empty model response",
-            geotags=geotags,
-        )
-
-    md_path = tender_output_dir / f"{tender_id}_report.md"
-    print("[6/6] Writing report")
-    write_text(md_path, report_md)
-    print(f"Markdown report: {md_path}")
-
-    if args.output != "full":
-        return 0
-
-    final_summary = json_synthesis or {
-        "tender_id": tender_id,
-        "executive_summary": "",
-        "status": str(doc_analysis.get("status") or "unknown"),
-        "key_points": [],
-        "timeline": [],
-        "web_signals": [],
-        "risks": [],
-        "red_flags": [],
-        "news_and_updates": [],
-        "file_findings": [],
-        "open_questions": [],
-        "sources": {"files": [], "urls": []},
-        "confidence": 0.0,
-    }
-
-    payload = {
+    pipeline_bundle = {
         "tender_id": tender_id,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "inputs": {
-            "downloads_root": str(downloads_root),
+            "source_root": str(source_root),
             "output_root": str(output_root),
-            "ollama_model": args.ollama_model,
-            "ollama_base_url": args.ollama_base_url,
-            "output": args.output,
-            "deepresearch_rounds": args.deepresearch_rounds,
-            "deepresearch_max_pages": args.deepresearch_max_pages,
-            "max_web_queries": args.max_web_queries,
-            "synthesis_max_tokens": args.synthesis_max_tokens,
-            "report_expand_tokens": args.report_expand_tokens,
-            "llm_num_ctx": args.llm_num_ctx,
-            "crawl_max_pages": args.crawl_max_pages,
-            "crawl_max_chars": args.crawl_max_chars,
-            "search_results_per_query": args.search_results_per_query,
-            "max_geocode_places": args.max_geocode_places,
-            "geocode_delay_seconds": args.geocode_delay_seconds,
-            "skip_geocode": args.skip_geocode,
+            "openrouter_model": openrouter_model,
+            "openrouter_base_url": openrouter_base_url,
         },
-        "geotags": geotags,
         "collection": collected,
         "document_count": len(docs),
         "extraction_issues": [asdict(issue) for issue in issues],
-        "project_intel": project_intel,
-        "document_analysis": doc_analysis,
-        "web_queries": queries,
-        "web_search_results": [asdict(item) for item in search_results],
-        "web_crawled_pages": crawled_pages,
-        "deepresearch": deepresearch,
-        "web_summary": web_summary,
-        "final_summary": final_summary,
-        "detailed_report_markdown": report_md,
+        "document_1": document1,
+        "document_2": document2,
+        "document_3": document3,
     }
-
-    json_path = tender_output_dir / f"{tender_id}_report.json"
-    html_path = tender_output_dir / f"{tender_id}_report.html"
-    write_json(json_path, payload)
-    html_text = build_html_report(
-        tender_id,
-        final_summary,
-        doc_analysis,
-        web_summary,
-        crawled_pages,
-        deepresearch,
-        issues,
-        report_markdown=report_md,
-    )
-    write_text(html_path, html_text)
-    print(f"JSON report: {json_path}")
-    print(f"HTML report: {html_path}")
+    bundle_path = tender_output_dir / f"{tender_id}_pipeline_bundle.json"
+    write_json(bundle_path, pipeline_bundle)
+    print(f"Pipeline bundle: {bundle_path}")
     return 0
 
 

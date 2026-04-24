@@ -2,12 +2,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import requests
 
 from telangana_tenders import TelanganaTenderClient, recursive_unzip
 from telangana_tenders.client import validate_zip
+
+OFFICE_EXTENSIONS = {
+    ".doc",
+    ".docx",
+    ".docm",
+    ".xls",
+    ".xlsx",
+    ".xlsm",
+    ".ppt",
+    ".pptx",
+    ".odt",
+    ".ods",
+    ".odp",
+}
+LEGACY_OFFICE_EXTENSIONS = {".doc", ".xls", ".ppt"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,7 +103,6 @@ def main() -> int:
         general = client.fetch_general_info(args.tender_id)
         general_json = general.to_json()
         print(f"\n[General] URL: {general.url}")
-        print(f"[General] Text preview: {general.text[:600]}")
         if args.write_html:
             write_text(output_dir / "inspect" / "general.html", general.html_text)
         if args.write_json:
@@ -95,7 +112,6 @@ def main() -> int:
         docs = client.fetch_documents_info(args.tender_id)
         docs_json = docs.to_json()
         print(f"\n[Documents] URL: {docs.url}")
-        print(f"[Documents] Text preview: {docs.text[:600]}")
         if args.write_html:
             write_text(output_dir / "inspect" / "documents.html", docs.html_text)
         if args.write_json:
@@ -106,7 +122,6 @@ def main() -> int:
             award = client.fetch_award_details(args.tender_id)
             award_json = award.to_json()
             print(f"\n[Award] URL: {award.url}")
-            print(f"[Award] Text preview: {award.text[:600]}")
             if args.write_html:
                 write_text(output_dir / "inspect" / "award.html", award.html_text)
             if args.write_json:
@@ -122,7 +137,6 @@ def main() -> int:
             award_docs = client.fetch_award_documents(args.tender_id)
             award_docs_json = award_docs.to_json()
             print(f"\n[AwardDocuments] URL: {award_docs.url}")
-            print(f"[AwardDocuments] Text preview: {award_docs.text[:600]}")
             if args.write_html:
                 write_text(output_dir / "inspect" / "award_documents.html", award_docs.html_text)
             if args.write_json:
@@ -147,6 +161,13 @@ def main() -> int:
             archives = recursive_unzip(zip_path, unzip_dir)
             print(f"Extracted archives: {len(archives)}")
             print(f"Extraction directory: {unzip_dir}")
+            conversion_summary = convert_office_files_to_markdown(unzip_dir)
+            print(
+                "Office->MD conversion: "
+                f"{conversion_summary['converted']} converted, "
+                f"{conversion_summary['failed']} failed, "
+                f"{conversion_summary['skipped']} skipped"
+            )
         elif args.unzip:
             print("Skipping unzip because the downloaded file is not a valid ZIP.")
     elif args.unzip:
@@ -165,6 +186,92 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
     print(f"Wrote: {path}")
+
+
+def convert_office_files_to_markdown(root: Path) -> dict[str, int]:
+    pandoc = shutil.which("pandoc")
+    if not pandoc:
+        print("Office->MD conversion skipped: `pandoc` not found in PATH.")
+        return {"converted": 0, "failed": 0, "skipped": 0}
+
+    converted = 0
+    failed = 0
+    skipped = 0
+    office_files = sorted([p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in OFFICE_EXTENSIONS])
+    for source in office_files:
+        target = Path(f"{source}.md")
+        if target.exists():
+            skipped += 1
+            continue
+
+        markdown = office_to_markdown(source, pandoc_bin=pandoc)
+        if not markdown:
+            failed += 1
+            continue
+
+        target.write_text(markdown, encoding="utf-8", errors="ignore")
+        converted += 1
+
+    return {"converted": converted, "failed": failed, "skipped": skipped}
+
+
+def office_to_markdown(source: Path, *, pandoc_bin: str) -> str:
+    suffix = source.suffix.lower()
+    soffice_bin = shutil.which("libreoffice") or shutil.which("soffice")
+    with tempfile.TemporaryDirectory(prefix="office_md_") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        input_path = source
+
+        if suffix in LEGACY_OFFICE_EXTENSIONS:
+            if soffice_bin:
+                converted = convert_with_libreoffice(source, tmp_root, "odt", soffice_bin=soffice_bin)
+                if converted is not None:
+                    input_path = converted
+        elif suffix in {".xls", ".xlsx", ".xlsm", ".ppt", ".pptx", ".ods", ".odp"}:
+            if soffice_bin:
+                converted = convert_with_libreoffice(source, tmp_root, "odt", soffice_bin=soffice_bin)
+                if converted is not None:
+                    input_path = converted
+
+        output_path = tmp_root / "converted.md"
+        try:
+            completed = subprocess.run(
+                [pandoc_bin, str(input_path), "--to=gfm", "--output", str(output_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+            )
+        except OSError:
+            return ""
+        if completed.returncode != 0 or not output_path.exists():
+            return ""
+        try:
+            return output_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return ""
+
+
+def convert_with_libreoffice(source: Path, out_dir: Path, target_ext: str, *, soffice_bin: str) -> Path | None:
+    try:
+        completed = subprocess.run(
+            [soffice_bin, "--headless", "--convert-to", target_ext, "--outdir", str(out_dir), str(source)],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    exact = sorted(out_dir.glob(f"{source.stem}.{target_ext}"))
+    if exact:
+        return exact[0]
+    any_match = sorted(out_dir.glob(f"*.{target_ext}"))
+    return any_match[0] if any_match else None
 
 
 if __name__ == "__main__":

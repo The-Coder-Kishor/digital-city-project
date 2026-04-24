@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Tender Report UI</title>
+  <style>
+    :root { --bg:#0b1220; --card:#0f1b33; --ink:#e5e7eb; --muted:#9ca3af; --accent:#22c55e; --line:#24324f; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Arial; background: radial-gradient(1000px 500px at 20% 0%, #13244a, var(--bg)); color:var(--ink); }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 22px; }
+    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .card { background: rgba(15, 27, 51, 0.9); border:1px solid var(--line); border-radius:14px; padding:14px; }
+    a { color: #93c5fd; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    input { background:#0b152b; color:var(--ink); border:1px solid var(--line); border-radius:10px; padding:10px 12px; min-width: 320px; }
+    button { background: #1f9d55; color:white; border:0; border-radius:10px; padding:10px 12px; cursor:pointer; }
+    button.secondary { background: #334155; }
+    .meta { color: var(--muted); font-size: 0.92rem; }
+    table { width:100%; border-collapse: collapse; }
+    td, th { border-bottom:1px solid var(--line); padding:10px 6px; text-align:left; vertical-align:top; }
+    th { color:#cbd5e1; font-weight:600; }
+    .pill { display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:0.82rem; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="row" style="justify-content:space-between;">
+      <div>
+        <h1 style="margin:0 0 6px;">Tender Report UI</h1>
+        <div class="meta">Workflow + sources UI for <code>agentic_tender_report_pipeline.py</code></div>
+      </div>
+      <div class="row">
+        <a href="/vendors" class="pill">Vendor explorer ({{ vendor_count }})</a>
+        <form method="post" action="/refresh">
+          <button class="secondary" type="submit">Refresh index</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <form class="row" method="get" action="/">
+        <input name="q" value="{{ q }}" placeholder="Search by Name-<id> (SQLite)..." />
+        <button type="submit">Search</button>
+        <span class="pill">{{ tenders | length }} tenders</span>
+        <a href="/vendors" class="pill">Search vendors</a>
+      </form>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <form class="row" method="post" action="/run_new">
+        <input name="tender_id" placeholder="Run new tender id (6 digits), e.g. 608806" />
+        <select name="output" style="width:auto;background:#0b152b;color:var(--ink);border:1px solid var(--line);border-radius:10px;padding:10px 12px;">
+          <option value="markdown">markdown (fast)</option>
+          <option value="full">full (json+html+md)</option>
+        </select>
+        <button type="submit">Run pipeline</button>
+        <span class="meta">This will download, research, and generate the report.</span>
+      </form>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <table>
+        <thead>
+          <tr>
+            <th>Tender</th>
+            <th>Name-Id</th>
+            <th>Artifacts</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in tenders %}
+          <tr>
+            <td><a href="/t/{{ t.tender_id }}">{{ t.tender_id }}</a></td>
+            <td>{{ t.name_id }}</td>
+            <td class="meta">
+              {% if t.report_md_path %}MD{% endif %}
+              {% if t.report_json_path %} · JSON{% endif %}
+              {% if t.report_html_path %} · HTML{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>
+
